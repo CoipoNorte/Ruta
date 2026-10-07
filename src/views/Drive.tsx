@@ -14,7 +14,8 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import {
   Gauge, Volume2, VolumeX, Pause, Play, Lock, LockOpen, ChevronUp, ChevronDown,
-  Milestone, Navigation, Timer as TimerIcon, Car,
+  Milestone, Navigation, Timer as TimerIcon, Car, ChevronLeft, ChevronRight,
+  CloudRain, ShieldCheck, Users, Hand,
 } from 'lucide-react'
 import { Game, EngineAudio, kmh, MAX_SPEED } from '@/game/engine'
 import { render } from '@/game/render'
@@ -50,12 +51,29 @@ export default function Drive() {
   const [fase, setFase] = useState<Fase>('intro')
   const [lock, setLock] = useState(false)       // traba del acelerador (crucero)
   const [muted, setMuted] = useState(false)
-  const [hud, setHud] = useState({ km: 0, vel: 0, gear: 1, time: 0, ovt: 0, flow: 1, rpm: 0, shift: 0 })
+  /** Lado de los pedales: 'der' (diestro) · 'izq' (zurdo). Se recuerda. */
+  const [lado, setLado] = useState<'izq' | 'der'>(() => {
+    try { return localStorage.getItem('ruta-lado') === 'izq' ? 'izq' : 'der' } catch { return 'der' }
+  })
+  const [hud, setHud] = useState({
+    km: 0, vel: 0, gear: 1, time: 0, ovt: 0, flow: 1, rpm: 0, shift: 0,
+    limit: 120, speeding: false, rain: 0, score: 100, blinker: 0 as -1 | 0 | 1,
+    blocked: false,
+  })
 
   const lockRef = useRef(lock); lockRef.current = lock
   const steerTouch = useRef<{ id: number; x0: number } | null>(null)
   const lastBuzz = useRef(0)
   const dragRef = useRef(84)
+
+  /* ---- ENTRADAS INDEPENDIENTES -----------------------------------------
+   * Teclado y puntero se guardan por separado y se fusionan en el bucle.
+   * Antes compartían `inputRef`, así que un puntero mal soltado dejaba
+   * `steering = true` y pisaba el volante del teclado en cada movimiento. */
+  const pointerSteer = useRef<number | null>(null)   // null = sin dedo/ratón
+  const keySteer = useRef<number | null>(null)       // null = sin tecla
+  const keyThrottle = useRef(false)
+  const keyBrake = useRef(false)
   /** Punto donde el jugador agarró el volante virtual (para el anillo guía). */
   const [grab, setGrab] = useState({ on: false, x: 0, y: 0 })
 
@@ -87,17 +105,17 @@ export default function Drive() {
       const g = gameRef.current
 
       if (faseRef.current === 'corriendo') {
-        const i = inputRef.current
-        g.update(dt, {
-          steer: i.steer,
-          steering: i.steering,
-          throttle: (i.throttle || lockRef.current) && !i.brake,
-          brake: i.brake,
-        })
-        audioRef.current.update(
-          g.rpm, g.speedPct, i.throttle || lockRef.current,
-          g.lateralG, g.shake,
-        )
+        /* FUSIÓN DE ENTRADAS: el teclado manda sobre el puntero mientras haya
+         * una tecla pulsada; si no, dirige el dedo. Cualquiera de las dos
+         * fuentes puede fallar sin bloquear a la otra. */
+        const kS = keySteer.current
+        const pS = pointerSteer.current
+        const steer = kS !== null ? kS : pS !== null ? pS : 0
+        const steering = kS !== null || pS !== null
+        const throttle = keyThrottle.current || inputRef.current.throttle || lockRef.current
+        const brake = keyBrake.current || inputRef.current.brake
+        g.update(dt, { steer, steering, throttle: throttle && !brake, brake })
+        audioRef.current.update(g.rpm, g.speedPct, throttle, g.lateralG, g.shake)
         // eventos de chasis → sonido y háptica
         if (g.gearChanged !== 0) audioRef.current.shift()
         if (g.shake > 0.5 && now - lastBuzz.current > 320) {
@@ -111,7 +129,12 @@ export default function Drive() {
       hudAcc += dt
       if (hudAcc > 0.08) {
         hudAcc = 0
-        setHud({ km: g.km, vel: Math.round(kmh(g.speed)), gear: g.gear, time: g.time, ovt: g.overtakes, flow: g.flow, rpm: g.rpm, shift: g.shiftFlash })
+        setHud({
+          km: g.km, vel: Math.round(kmh(g.speed)), gear: g.gear, time: g.time,
+          ovt: g.overtakes, flow: g.flow, rpm: g.rpm, shift: g.shiftFlash,
+          limit: g.limit, speeding: g.speeding, rain: g.rain,
+          score: Math.round(g.score), blinker: g.blinker, blocked: g.blockedAll,
+        })
       }
     }
     rafRef.current = requestAnimationFrame(loop)
@@ -134,7 +157,11 @@ export default function Drive() {
   const pausar = useCallback(() => {
     inputRef.current.throttle = false
     inputRef.current.brake = false
-    inputRef.current.steering = false
+    keyThrottle.current = false
+    keyBrake.current = false
+    keySteer.current = null
+    pointerSteer.current = null
+    steerTouch.current = null
     audioRef.current.stop()
     setFaseBoth('pausa')
   }, [setFaseBoth])
@@ -151,63 +178,144 @@ export default function Drive() {
    * se ignoran aquí y quedan libres para los pedales (que están por encima
    * en z-index y reciben sus propios eventos).
    * ----------------------------------------------------------------------*/
+  /** Suelta el volante táctil y limpia TODO rastro del puntero. */
+  const soltarVolante = useCallback(() => {
+    if (!steerTouch.current) return
+    steerTouch.current = null
+    pointerSteer.current = null
+    setGrab((g) => (g.on ? { ...g, on: false } : g))
+  }, [])
+
   const onWheelDown = (e: React.PointerEvent) => {
     if (faseRef.current !== 'corriendo') return
     if (steerTouch.current) return                 // ya hay un dedo dirigiendo
-    e.currentTarget.setPointerCapture(e.pointerId)
+    try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* no crítico */ }
     steerTouch.current = { id: e.pointerId, x0: e.clientX }
-    inputRef.current.steering = true
-    inputRef.current.steer = 0
+    pointerSteer.current = 0
     setGrab({ on: true, x: e.clientX, y: e.clientY })
   }
   const onWheelMove = (e: React.PointerEvent) => {
     const t = steerTouch.current
     if (!t || t.id !== e.pointerId) return
-    inputRef.current.steer = steerCurve((e.clientX - t.x0) / dragRef.current)
+    // SEGURO ANTI-ATASCO: con ratón, si ya no hay botón pulsado es que se
+    // perdió el `pointerup` (se soltó fuera de la ventana). Antes esto dejaba
+    // el puntero "pegado" y machacaba el valor del teclado en cada movimiento.
+    if (e.pointerType === 'mouse' && e.buttons === 0) { soltarVolante(); return }
+    pointerSteer.current = steerCurve((e.clientX - t.x0) / dragRef.current)
   }
   const onWheelUp = (e: React.PointerEvent) => {
     const t = steerTouch.current
     if (!t || t.id !== e.pointerId) return
-    steerTouch.current = null
-    inputRef.current.steering = false   // el motor lo devuelve al centro solo
-    inputRef.current.steer = 0
-    setGrab((g) => ({ ...g, on: false }))
+    soltarVolante()                 // el motor lo devuelve al centro solo
   }
 
+  /* Pedales. Mantener pulsado en móvil dispara el menú contextual del sistema
+   * (long-press ≈ clic derecho) y la selección de texto; hay que cancelar
+   * explícitamente `contextmenu`, `selectstart` y `dragstart`. */
   const hold = (campo: 'throttle' | 'brake') => ({
     onPointerDown: (e: React.PointerEvent) => {
+      if (e.button !== 0 && e.pointerType === 'mouse') return   // ignora botón derecho
       e.preventDefault()
-      e.currentTarget.setPointerCapture(e.pointerId)
+      e.stopPropagation()
+      try { e.currentTarget.setPointerCapture(e.pointerId) } catch { /* no crítico */ }
       inputRef.current[campo] = true
-      if (campo === 'throttle' && faseRef.current === 'intro') arrancar()
+      if (campo === 'throttle' && faseRef.current !== 'corriendo') arrancar()
     },
     onPointerUp: () => { inputRef.current[campo] = false },
     onPointerCancel: () => { inputRef.current[campo] = false },
     onPointerLeave: () => { inputRef.current[campo] = false },
+    onContextMenu: (e: React.MouseEvent) => e.preventDefault(),
+    onDragStart: (e: React.DragEvent) => e.preventDefault(),
   })
 
-  /* teclado (pruebas en escritorio) */
+  /* ------------------------------- TECLADO --------------------------------
+   * Se registra UNA sola vez (deps vacías) leyendo las acciones por ref, para
+   * que no se desenganche nunca al recrearse los callbacks. Se escucha en
+   * fase de captura sobre `window` y se cancela el comportamiento por defecto
+   * de las teclas de juego (evita el scroll con flechas/espacio).
+   * ----------------------------------------------------------------------*/
+  const accionesRef = useRef({ arrancar, pausar, reanudar })
+  accionesRef.current = { arrancar, pausar, reanudar }
+
   useEffect(() => {
+    const IZQ = ['ArrowLeft', 'KeyA'], DER = ['ArrowRight', 'KeyD']
+    const ACE = ['ArrowUp', 'KeyW'], FRE = ['ArrowDown', 'KeyS']
+    const JUEGO = [...IZQ, ...DER, ...ACE, ...FRE, 'Space', 'KeyQ', 'KeyE']
+
     const dn = (e: KeyboardEvent) => {
+      // no robar teclas si el foco está en un control de formulario
+      const t = e.target as HTMLElement | null
+      if (t?.closest?.('input, textarea, select, [contenteditable="true"]')) return
+      if (JUEGO.includes(e.code)) e.preventDefault()
       if (e.repeat) return
-      const i = inputRef.current
-      if (e.code === 'ArrowLeft' || e.code === 'KeyA') { i.steering = true; i.steer = -1 }
-      if (e.code === 'ArrowRight' || e.code === 'KeyD') { i.steering = true; i.steer = 1 }
-      if (e.code === 'ArrowUp' || e.code === 'KeyW') { i.throttle = true; if (faseRef.current === 'intro') arrancar() }
-      if (e.code === 'ArrowDown' || e.code === 'KeyS') i.brake = true
-      if (e.code === 'Space') { e.preventDefault(); setLock((l) => !l) }
-      if (e.code === 'Escape') faseRef.current === 'corriendo' ? pausar() : reanudar()
+
+      if (IZQ.includes(e.code)) keySteer.current = -1
+      else if (DER.includes(e.code)) keySteer.current = 1
+      else if (ACE.includes(e.code)) {
+        keyThrottle.current = true
+        if (faseRef.current !== 'corriendo') accionesRef.current.arrancar()
+      }
+      else if (FRE.includes(e.code)) keyBrake.current = true
+      else if (e.code === 'KeyQ') gameRef.current.setBlinker(-1)
+      else if (e.code === 'KeyE') gameRef.current.setBlinker(1)
+      else if (e.code === 'Space') setLock((l) => !l)
+      else if (e.code === 'Escape') {
+        if (faseRef.current === 'corriendo') accionesRef.current.pausar()
+        else accionesRef.current.reanudar()
+      }
     }
+
     const up = (e: KeyboardEvent) => {
-      const i = inputRef.current
-      if (e.code === 'ArrowLeft' || e.code === 'KeyA' || e.code === 'ArrowRight' || e.code === 'KeyD') { i.steering = false; i.steer = 0 }
-      if (e.code === 'ArrowUp' || e.code === 'KeyW') i.throttle = false
-      if (e.code === 'ArrowDown' || e.code === 'KeyS') i.brake = false
+      if (IZQ.includes(e.code) && keySteer.current === -1) keySteer.current = null
+      else if (DER.includes(e.code) && keySteer.current === 1) keySteer.current = null
+      else if (ACE.includes(e.code)) keyThrottle.current = false
+      else if (FRE.includes(e.code)) keyBrake.current = false
     }
-    window.addEventListener('keydown', dn)
-    window.addEventListener('keyup', up)
-    return () => { window.removeEventListener('keydown', dn); window.removeEventListener('keyup', up) }
-  }, [arrancar, pausar, reanudar])
+
+    // al perder el foco de la ventana se sueltan todas las teclas
+    const reset = () => {
+      keySteer.current = null
+      keyThrottle.current = false
+      keyBrake.current = false
+    }
+
+    window.addEventListener('keydown', dn, { capture: true })
+    window.addEventListener('keyup', up, { capture: true })
+    window.addEventListener('blur', reset)
+    return () => {
+      window.removeEventListener('keydown', dn, { capture: true })
+      window.removeEventListener('keyup', up, { capture: true })
+      window.removeEventListener('blur', reset)
+    }
+  }, [])
+
+  /* Red de seguridad global del puntero: si el `pointerup` se pierde (soltar
+   * fuera de la ventana, cambio de pestaña, gesto del sistema), liberamos el
+   * volante igualmente para que no quede "pegado". */
+  useEffect(() => {
+    const libera = () => soltarVolante()
+    window.addEventListener('pointerup', libera)
+    window.addEventListener('pointercancel', libera)
+    window.addEventListener('blur', libera)
+    return () => {
+      window.removeEventListener('pointerup', libera)
+      window.removeEventListener('pointercancel', libera)
+      window.removeEventListener('blur', libera)
+    }
+  }, [soltarVolante])
+
+  /* Bloqueo global del menú contextual y de la selección: en móvil, mantener
+   * el dedo sobre un botón equivale a un clic derecho y abre el menú del
+   * sistema, que interrumpe la partida. */
+  useEffect(() => {
+    const noMenu = (e: Event) => e.preventDefault()
+    document.addEventListener('contextmenu', noMenu)
+    document.addEventListener('selectstart', noMenu)
+    return () => {
+      document.removeEventListener('contextmenu', noMenu)
+      document.removeEventListener('selectstart', noMenu)
+    }
+  }, [])
 
   /* pausa automática al cambiar de pestaña */
   useEffect(() => {
@@ -217,6 +325,7 @@ export default function Drive() {
   }, [pausar])
 
   useEffect(() => { audioRef.current.muted = muted }, [muted])
+  useEffect(() => { try { localStorage.setItem('ruta-lado', lado) } catch { /* sin storage */ } }, [lado])
 
   /* -------------------------------- HUD UI -------------------------------- */
   const velPct = Math.min(1, hud.vel / kmh(MAX_SPEED))
@@ -229,59 +338,88 @@ export default function Drive() {
       <div className="pointer-events-none absolute inset-x-0 top-0 z-20 p-3">
         <div className="flex items-start justify-between gap-2">
           {/* odómetro */}
-          <div className="rounded-xl border border-white/10 bg-black/45 px-3 py-2 backdrop-blur-sm">
-            <p className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.22em] text-white/50">
-              <Milestone className="size-3" /> recorrido
+          <div className="rounded-lg border border-white/[0.07] bg-black/25 px-2.5 py-1.5 backdrop-blur-sm">
+            <p className="flex items-center gap-1 font-mono text-[8px] uppercase tracking-[0.2em] text-white/40">
+              <Milestone className="size-2.5" /> recorrido
             </p>
-            <p className="font-mono text-2xl font-semibold leading-none tabular-nums">
-              {hud.km.toFixed(2)}<span className="ml-1 text-xs text-white/60">km</span>
+            <p className="font-mono text-xl font-semibold leading-none tabular-nums">
+              {hud.km.toFixed(2)}<span className="ml-1 text-[10px] text-white/50">km</span>
             </p>
           </div>
 
-          <div className="flex items-center gap-2">
-            <div className="rounded-xl border border-white/10 bg-black/45 px-2.5 py-2 text-center backdrop-blur-sm">
-              <p className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/50">tiempo</p>
-              <p className="font-mono text-sm font-semibold tabular-nums">{fmtTime(hud.time)}</p>
+          <div className="flex items-center gap-1.5">
+            <div className="rounded-lg border border-white/[0.07] bg-black/25 px-2 py-1.5 text-center backdrop-blur-sm">
+              <p className="font-mono text-[8px] uppercase tracking-[0.16em] text-white/40">tiempo</p>
+              <p className="font-mono text-xs font-semibold tabular-nums">{fmtTime(hud.time)}</p>
             </div>
-            <div className="rounded-xl border border-white/10 bg-black/45 px-2.5 py-2 text-center backdrop-blur-sm">
-              <p className="font-mono text-[9px] uppercase tracking-[0.18em] text-white/50">adelant.</p>
-              <p className="font-mono text-sm font-semibold tabular-nums">{hud.ovt}</p>
+            <div className="rounded-lg border border-white/[0.07] bg-black/25 px-2 py-1.5 text-center backdrop-blur-sm">
+              <p className="font-mono text-[8px] uppercase tracking-[0.16em] text-white/40">adelant.</p>
+              <p className="font-mono text-xs font-semibold tabular-nums">{hud.ovt}</p>
             </div>
             <button
               onClick={() => setMuted((m) => !m)}
-              className="pointer-events-auto grid size-9 place-items-center rounded-xl border border-white/10 bg-black/45 text-white/70 backdrop-blur-sm active:scale-95"
+              className="pointer-events-auto grid size-8 place-items-center rounded-lg border border-white/[0.07] bg-black/25 text-white/55 backdrop-blur-sm active:scale-90"
               aria-label="Sonido"
             >
-              {muted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
+              {muted ? <VolumeX className="size-3.5" /> : <Volume2 className="size-3.5" />}
             </button>
             <button
               onClick={() => (fase === 'corriendo' ? pausar() : reanudar())}
-              className="pointer-events-auto grid size-9 place-items-center rounded-xl border border-white/10 bg-black/45 text-white/70 backdrop-blur-sm active:scale-95"
+              className="pointer-events-auto grid size-8 place-items-center rounded-lg border border-white/[0.07] bg-black/25 text-white/55 backdrop-blur-sm active:scale-90"
               aria-label="Pausa"
             >
-              {fase === 'corriendo' ? <Pause className="size-4" /> : <Play className="size-4" />}
+              {fase === 'corriendo' ? <Pause className="size-3.5" /> : <Play className="size-3.5" />}
             </button>
           </div>
         </div>
 
-        {/* barra de ritmo: sube conduciendo suave y lejos de la banquina */}
+        {/* puntuación de conducción: respeta límites, señaliza y ve suave */}
         <div className="mt-2 flex items-center gap-2">
-          <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-white/45">ritmo</span>
+          <span className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-[0.2em] text-white/45">
+            <ShieldCheck className="size-3" /> conducción
+          </span>
           <div className="h-1 flex-1 overflow-hidden rounded-full bg-white/10">
-            <div className="h-full rounded-full bg-emerald-400/80 transition-[width] duration-500" style={{ width: `${hud.flow * 100}%` }} />
+            <div
+              className={cn(
+                'h-full rounded-full transition-[width,background-color] duration-500',
+                hud.score > 75 ? 'bg-emerald-400/85' : hud.score > 45 ? 'bg-amber-300/85' : 'bg-red-400/85',
+              )}
+              style={{ width: `${hud.score}%` }}
+            />
           </div>
+          <span className="w-7 text-right font-mono text-[10px] tabular-nums text-white/70">{hud.score}</span>
+          {hud.rain > 0.15 && (
+            <span className="flex items-center gap-1 rounded-full border border-sky-300/30 bg-sky-300/10 px-1.5 py-0.5 font-mono text-[8px] uppercase tracking-wider text-sky-200">
+              <CloudRain className="size-2.5" /> {hud.rain > 0.6 ? 'fuerte' : 'lluvia'}
+            </span>
+          )}
+          {hud.blocked && (
+            <span className="flex items-center gap-1 rounded-full border border-amber-300/30 bg-amber-300/10 px-1.5 py-0.5 font-mono text-[8px] uppercase tracking-wider text-amber-200">
+              <Users className="size-2.5" /> retención
+            </span>
+          )}
         </div>
       </div>
 
       {/* ============================== VELOCÍMETRO ==========================
           Reubicado al tercio superior: no tapa la calzada ni los pedales y
           queda en la línea de visión natural, como un head-up display. */}
-      <div className="pointer-events-none absolute left-1/2 top-[20%] z-20 -translate-x-1/2 text-center">
-        <div className="flex items-end justify-center gap-2">
+      <div className="pointer-events-none absolute left-1/2 top-[22%] z-20 -translate-x-1/2 text-center">
+        <div className="flex items-end justify-center gap-3">
           <p className="font-mono text-[4.2rem] font-bold leading-[0.85] tabular-nums drop-shadow-[0_2px_16px_rgba(0,0,0,0.9)]">
             {hud.vel}
           </p>
           <span className="mb-2 font-mono text-[11px] uppercase tracking-[0.2em] text-white/55">km/h</span>
+          {/* Disco del tramo: SOLO informativo/ambiental. El jugador puede ir a
+              su ritmo; quienes lo respetan son los coches de la IA. */}
+          <span
+            className={cn(
+              'mb-1 grid size-10 place-items-center rounded-full border-[3px] border-[#D33A2C] bg-[#F2EFE8] font-mono text-[13px] font-bold text-[#17181C] transition-opacity',
+              hud.speeding ? 'opacity-100' : 'opacity-70',
+            )}
+          >
+            {hud.limit}
+          </span>
         </div>
         {/* barra de revoluciones + marcha actual */}
         <div className="mx-auto mt-2 flex items-center gap-2">
@@ -314,62 +452,91 @@ export default function Drive() {
         className="absolute inset-0 z-10 touch-none"
       />
 
-      {/* Anillo guía en el punto de agarre: feedback de que el dedo manda */}
+      {/* Anillo guía en el punto de agarre: discreto, solo un rastro del dedo */}
       {grab.on && (
         <div
           className="pointer-events-none absolute z-20"
           style={{ left: grab.x, top: grab.y, transform: 'translate(-50%,-50%)' }}
         >
-          <div className="relative grid size-24 place-items-center rounded-full border border-white/20 bg-white/5 backdrop-blur-[2px]">
-            <div className="h-px w-16 bg-white/20" />
+          <div className="relative grid size-14 place-items-center rounded-full border border-white/15 bg-white/[0.04]">
             <GrabKnob gameRef={gameRef} />
           </div>
         </div>
       )}
 
-      {/* ========================= INDICADOR DE VOLANTE ======================
-          Solo informativo (pointer-events-none): el control real es la pantalla. */}
-      <div className="pointer-events-none absolute bottom-6 left-4 z-20 w-[52%] max-w-64">
-        <div className="rounded-2xl border border-white/10 bg-black/35 p-3 backdrop-blur-sm">
-          <div className="flex items-center justify-between font-mono text-[9px] uppercase tracking-[0.2em] text-white/45">
-            <span className="flex items-center gap-1"><Navigation className="size-3" /> volante</span>
-            <span>vuelve solo</span>
-          </div>
-          <div className="relative mt-2 h-9 rounded-full border border-white/10 bg-black/40">
-            <div className="absolute left-1/2 top-1/2 h-5 w-px -translate-x-1/2 -translate-y-1/2 bg-white/20" />
-            <SteerKnob inputRef={inputRef} gameRef={gameRef} />
-          </div>
-          <p className="mt-1.5 text-center font-mono text-[9px] uppercase tracking-[0.18em] text-white/35">
-            desliza en cualquier parte
-          </p>
+      {/* ====================== CONTROLES INFERIORES ========================
+          Rediseño para vertical: todo pegado a los bordes y translúcido para
+          no tapar el coche, que vive en el centro-bajo de la pantalla.
+          · Volante  → barra FINA al borde inferior (solo indicador).
+          · Pedales  → columna derecha, compactos.
+          · Flechas  → mínimas, junto a los pedales.
+          ==================================================================== */}
+
+      {/* --- barra de volante: indicador plano, sin caja ni etiquetas --- */}
+      <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 px-5 pb-3">
+        <div className="relative mx-auto h-1.5 max-w-sm rounded-full bg-white/10">
+          {/* marca de centro */}
+          <span className="absolute left-1/2 top-1/2 h-2.5 w-px -translate-x-1/2 -translate-y-1/2 bg-white/25" />
+          <SteerKnob gameRef={gameRef} />
         </div>
       </div>
 
-      {/* ================================ PEDALES ============================ */}
-      <div className="absolute bottom-6 right-4 z-20 flex flex-col items-center gap-2">
+      {/* --- pedales + accesorios: columna compacta, lado configurable --- */}
+      <div
+        className={cn(
+          'absolute bottom-7 z-30 flex flex-col items-center gap-2.5',
+          lado === 'der' ? 'right-3' : 'left-3',
+        )}
+      >
+        {/* intermitentes: pequeños, en fila sobre los pedales */}
+        <div className="flex gap-1.5">
+          {([-1, 1] as const).map((dir) => {
+            const on = hud.blinker === dir
+            return (
+              <button
+                key={dir}
+                onClick={() => gameRef.current.setBlinker(dir)}
+                className={cn(
+                  'grid size-8 place-items-center rounded-lg border transition-all active:scale-90',
+                  on
+                    ? 'animate-pulse border-amber-300/70 bg-amber-300/20 text-amber-200'
+                    : 'border-white/10 bg-black/25 text-white/40',
+                )}
+                aria-label={dir < 0 ? 'Intermitente izquierdo' : 'Intermitente derecho'}
+              >
+                {dir < 0 ? <ChevronLeft className="size-4" /> : <ChevronRight className="size-4" />}
+              </button>
+            )
+          })}
+        </div>
+
+        {/* traba del acelerador */}
         <button
           onClick={() => setLock((l) => !l)}
           className={cn(
-            'flex items-center gap-1.5 rounded-full border px-3 py-1.5 font-mono text-[9px] font-bold uppercase tracking-[0.18em] backdrop-blur-sm active:scale-95',
-            lock ? 'border-emerald-400/60 bg-emerald-400/20 text-emerald-300' : 'border-white/15 bg-black/45 text-white/60',
+            'grid size-8 place-items-center rounded-lg border transition-all active:scale-90',
+            lock
+              ? 'border-emerald-400/60 bg-emerald-400/20 text-emerald-300'
+              : 'border-white/10 bg-black/25 text-white/40',
           )}
+          aria-label="Traba del acelerador"
         >
-          {lock ? <Lock className="size-3" /> : <LockOpen className="size-3" />} traba
+          {lock ? <Lock className="size-3.5" /> : <LockOpen className="size-3.5" />}
         </button>
 
         <button
           {...hold('throttle')}
-          className="grid size-20 touch-none place-items-center rounded-full border-2 border-emerald-400/50 bg-emerald-400/15 text-emerald-300 backdrop-blur-sm transition-transform active:scale-95 active:bg-emerald-400/30"
+          className="grid size-16 touch-none place-items-center rounded-full border border-emerald-400/35 bg-emerald-400/10 text-emerald-300/80 transition-all active:scale-95 active:border-emerald-400/70 active:bg-emerald-400/25 active:text-emerald-200"
           aria-label="Acelerar"
         >
-          <ChevronUp className="size-8" />
+          <ChevronUp className="size-7" />
         </button>
         <button
           {...hold('brake')}
-          className="grid size-16 touch-none place-items-center rounded-full border-2 border-red-400/50 bg-red-400/15 text-red-300 backdrop-blur-sm transition-transform active:scale-95 active:bg-red-400/30"
+          className="grid size-[3.25rem] touch-none place-items-center rounded-full border border-red-400/35 bg-red-400/10 text-red-300/80 transition-all active:scale-95 active:border-red-400/70 active:bg-red-400/25 active:text-red-200"
           aria-label="Frenar"
         >
-          <ChevronDown className="size-7" />
+          <ChevronDown className="size-6" />
         </button>
       </div>
 
@@ -398,6 +565,7 @@ export default function Drive() {
                     <li className="flex gap-2"><Navigation className="mt-px size-3.5 shrink-0 text-signal" /> Desliza el dedo <strong className="text-white/80">en cualquier parte</strong> de la pantalla: es el volante. Al soltar vuelve solo al centro.</li>
                     <li className="flex gap-2"><Gauge className="mt-px size-3.5 shrink-0 text-signal" /> Caja automática: solo acelerar y frenar.</li>
                     <li className="flex gap-2"><Lock className="mt-px size-3.5 shrink-0 text-signal" /> TRABA mantiene el acelerador: conduce con una mano.</li>
+                    <li className="flex gap-2"><ShieldCheck className="mt-px size-3.5 shrink-0 text-signal" /> Mira el retrovisor, señaliza antes de cambiar de carril y respeta el límite: suma puntos.</li>
                   </ul>
                   <button
                     onClick={arrancar}
@@ -410,11 +578,12 @@ export default function Drive() {
                 <>
                   <TimerIcon className="mx-auto size-8 text-signal" />
                   <h2 className="mt-3 font-display text-3xl font-black uppercase tracking-tight">En el arcén</h2>
-                  <div className="mt-5 grid grid-cols-3 gap-2">
+                  <div className="mt-5 grid grid-cols-2 gap-2">
                     {[
                       { v: hud.km.toFixed(2), l: 'km' },
                       { v: fmtTime(hud.time), l: 'tiempo' },
                       { v: String(hud.ovt), l: 'adelant.' },
+                      { v: `${hud.score}`, l: 'conducción' },
                     ].map((s) => (
                       <div key={s.l} className="rounded-xl border border-white/10 p-3">
                         <p className="font-mono text-lg font-semibold tabular-nums">{s.v}</p>
@@ -422,9 +591,38 @@ export default function Drive() {
                       </div>
                     ))}
                   </div>
+                  {/* --- distribución de los controles (diestro / zurdo) --- */}
+                  <div className="mt-5 rounded-xl border border-white/10 p-3">
+                    <p className="mb-2 flex items-center justify-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.2em] text-white/45">
+                      <Hand className="size-3" /> pedales
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      {([
+                        { id: 'izq' as const, txt: 'Izquierda', Icon: ChevronLeft },
+                        { id: 'der' as const, txt: 'Derecha', Icon: ChevronRight },
+                      ]).map(({ id, txt, Icon }) => (
+                        <button
+                          key={id}
+                          onClick={() => setLado(id)}
+                          className={cn(
+                            'flex items-center justify-center gap-1.5 rounded-lg border py-2.5 font-mono text-[10px] uppercase tracking-[0.14em] transition-all active:scale-95',
+                            lado === id
+                              ? 'border-signal/70 bg-signal/15 text-signal'
+                              : 'border-white/10 bg-black/25 text-white/50',
+                          )}
+                        >
+                          <Icon className="size-3.5" /> {txt}
+                        </button>
+                      ))}
+                    </div>
+                    <p className="mt-2 font-mono text-[9px] leading-relaxed text-white/35">
+                      El volante sigue siendo toda la pantalla
+                    </p>
+                  </div>
+
                   <button
                     onClick={reanudar}
-                    className="mt-6 w-full rounded-xl bg-signal py-3.5 font-mono text-[12px] font-bold uppercase tracking-[0.28em] text-ink active:scale-[0.98]"
+                    className="mt-4 w-full rounded-xl bg-signal py-3.5 font-mono text-[12px] font-bold uppercase tracking-[0.28em] text-ink active:scale-[0.98]"
                   >
                     Continuar
                   </button>
@@ -449,7 +647,7 @@ function GrabKnob({ gameRef }: { gameRef: React.RefObject<Game> }) {
     const tick = () => {
       id = requestAnimationFrame(tick)
       const el = ref.current
-      if (el) el.style.transform = `translate(calc(-50% + ${gameRef.current.steer * 34}px), -50%)`
+      if (el) el.style.transform = `translate(calc(-50% + ${gameRef.current.steer * 17}px), -50%)`
     }
     id = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(id)
@@ -457,7 +655,7 @@ function GrabKnob({ gameRef }: { gameRef: React.RefObject<Game> }) {
   return (
     <div
       ref={ref}
-      className="absolute left-1/2 top-1/2 size-9 rounded-full border-2 border-white/60 bg-white/25 shadow-lg"
+      className="absolute left-1/2 top-1/2 size-6 rounded-full border border-white/50 bg-white/20"
     />
   )
 }
@@ -466,10 +664,7 @@ function GrabKnob({ gameRef }: { gameRef: React.RefObject<Game> }) {
  * Perilla del indicador inferior: se anima leyendo el estado real del motor
  * (incluido el auto-centrado), fuera del ciclo de render de React.
  * ------------------------------------------------------------------------*/
-function SteerKnob({ inputRef, gameRef }: {
-  inputRef: React.RefObject<{ steer: number; steering: boolean; throttle: boolean; brake: boolean }>
-  gameRef: React.RefObject<Game>
-}) {
+function SteerKnob({ gameRef }: { gameRef: React.RefObject<Game> }) {
   const ref = useRef<HTMLDivElement>(null)
   useEffect(() => {
     let id = 0
@@ -477,17 +672,20 @@ function SteerKnob({ inputRef, gameRef }: {
       id = requestAnimationFrame(tick)
       const el = ref.current
       if (!el) return
+      // se lee del motor: refleja por igual el teclado y el dedo
       const s = gameRef.current.steer
-      el.style.transform = `translate(calc(-50% + ${s * 42}%), -50%)`
-      el.style.opacity = inputRef.current.steering ? '1' : '0.65'
+      // `left` en % del riel: la perilla recorre toda la barra
+      el.style.left = `${50 + s * 44}%`
+      el.style.opacity = Math.abs(s) > 0.02 ? '0.95' : '0.5'
     }
     id = requestAnimationFrame(tick)
     return () => cancelAnimationFrame(id)
-  }, [inputRef, gameRef])
+  }, [gameRef])
   return (
     <div
       ref={ref}
-      className="absolute left-1/2 top-1/2 h-7 w-16 rounded-full border border-white/25 bg-white/85 shadow-lg transition-opacity"
+      className="absolute top-1/2 h-1.5 w-12 -translate-x-1/2 -translate-y-1/2 rounded-full bg-white/90"
+      style={{ left: '50%' }}
     />
   )
 }

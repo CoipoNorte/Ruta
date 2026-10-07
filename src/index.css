@@ -36,7 +36,15 @@ body {
   -webkit-tap-highlight-color: transparent;
 }
 
-/* Sin resaltado azul al pulsar los controles */
-button { -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+/* Sin resaltado azul, sin menú de long-press y sin arrastre de los controles.
+   `-webkit-touch-callout: none` es lo que impide que mantener pulsado abra el
+   menú contextual del sistema en iOS/Android. */
+button {
+  -webkit-tap-highlight-color: transparent;
+  -webkit-touch-callout: none;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
 
 canvas { display: block; image-rendering: auto; }
