@@ -19,14 +19,21 @@ export const CAM_H = 1500           // altura de cámara
 export const CAM_DEPTH = 1 / Math.tan(((92 / 2) * Math.PI) / 180)
 
 export const MAX_SPEED = 5600       // ≈ 200 km/h
-const ACCEL = 320                   // 0–100 km/h en ~9 s
-const BRAKE = 900
-const DRAG = 170                    // retención del motor al soltar
+const ACCEL = 560                   // 0–100 km/h en ~6 s (respuesta viva)
+const BRAKE = 1250
+const DRAG = 180                    // retención del motor al soltar
 const OFFROAD_MAX = 1700            // ≈ 61 km/h en la banquina
 const OFFROAD_DECEL = 1400
-const STEER_RATE = 1.25             // unidades de carril por segundo a tope
-const CENTRIFUGAL = 0.075
-const RETURN_RATE = 9               // auto-centrado del volante
+const STEER_RATE = 1.7              // unidades de calzada por segundo a tope
+const CENTRIFUGAL = 0.085
+const RETURN_RATE = 10              // auto-centrado del volante
+const STEER_ATTACK = 22             // rapidez con que el volante sigue al dedo
+
+/* Geometría del coche propio. El render PROYECTA estas medidas con la misma
+ * fórmula que el tráfico, así la escala nunca se desajusta (antes era un
+ * porcentaje fijo del ancho de pantalla y se veía gigante). */
+export const PLAYER_W = 380         // mismo ancho físico que un turismo IA
+export const PLAYER_Z = 1750        // distancia cámara → coche (17,5 m)
 
 export const kmh = (u: number) => u * 0.036
 export const toKm = (u: number) => u / 100000
@@ -96,6 +103,21 @@ export class Game {
   shake = 0             // vibración de banquina
   courtesy = 0          // >0 mientras frenamos por cortesía tras otro coche
   flow = 1              // 0..1 "ritmo": sube conduciendo suave
+
+  /* ---- DINÁMICA DE CHASIS Y CÁMARA (presentación: no altera la trayectoria)
+   * Es la capa que da "peso" al coche. Todo son muelles amortiguados de
+   * primer/segundo orden alimentados por la física real del frame. */
+  camLag = 0            // la cámara persigue al coche → inercia lateral
+  pitch = 0             // cabeceo: hunde el morro al frenar, lo eleva al acelerar
+  roll = 0              // balanceo de carrocería en apoyo
+  susp = 0              // suspensión: desplazamiento vertical
+  suspV = 0             // velocidad del muelle
+  slip = 0              // ángulo de deriva visual (el coche "apunta" al giro)
+  lateralG = 0          // 0..1 carga lateral → chirrido y vibración
+  shiftFlash = 0        // >0 justo tras un cambio de marcha
+  gearChanged = 0       // 1 subida · -1 reducción · 0 nada (se consume por frame)
+  private prevSpeed = 0
+  private prevGear = 1
   private nextId = 1
   private spawnAcc = 0
 
@@ -247,7 +269,7 @@ export class Game {
 
     /* --- volante: sigue al dedo y vuelve solo al centro al soltar --- */
     const objetivo = input.steering ? input.steer : 0
-    const k = input.steering ? 12 : RETURN_RATE
+    const k = input.steering ? STEER_ATTACK : RETURN_RATE
     this.steer += (objetivo - this.steer) * Math.min(1, k * dt)
     if (!input.steering && Math.abs(this.steer) < 0.004) this.steer = 0
 
@@ -271,9 +293,9 @@ export class Game {
     }
     this.speed = Math.max(0, Math.min(MAX_SPEED, this.speed))
 
-    /* --- dirección: más efectiva con algo de velocidad --- */
+    /* --- dirección: ágil ya desde baja velocidad, estable en punta --- */
     const pct = this.speedPct
-    this.x += this.steer * STEER_RATE * (0.32 + 0.68 * Math.min(1, pct * 2.2)) * dt
+    this.x += this.steer * STEER_RATE * (0.55 + 0.45 * Math.min(1, pct * 2.4)) * dt
     /* --- fuerza centrífuga: hay que apoyar el volante en las curvas --- */
     this.x -= this.curve * pct * pct * CENTRIFUGAL * dt
     this.x = Math.max(-1.32, Math.min(1.32, this.x))
@@ -307,8 +329,41 @@ export class Game {
     const suave = !input.brake && !fuera && this.courtesy === 0 ? 1 : 0
     this.flow += ((suave ? 1 : 0.25) - this.flow) * Math.min(1, dt * 0.6)
 
+    this.updateDynamics(dt)
     this.updateTraffic(dt)
     this.updateGear()
+  }
+
+  /* ---------------------- DINÁMICA DE CHASIS / CÁMARA --------------------- */
+  private updateDynamics(dt: number) {
+    const pct = this.speedPct
+
+    // cabeceo: derivada real de la velocidad (dive al frenar, squat al acelerar)
+    const accel = (this.speed - this.prevSpeed) / Math.max(dt, 0.0001)
+    this.prevSpeed = this.speed
+    const objPitch = Math.max(-1, Math.min(1, accel / 1500))
+    this.pitch += (objPitch - this.pitch) * Math.min(1, dt * 6)
+
+    // carga lateral = volante + centrífuga de la curva que estamos trazando
+    const lat = this.steer * pct - this.curve * pct * pct * 0.4
+    this.lateralG = Math.min(1, Math.abs(lat) * 1.7)
+    this.roll += (lat - this.roll) * Math.min(1, dt * 7)
+
+    // deriva: la carrocería gira un poco antes que la trayectoria
+    this.slip += (this.steer * (0.3 + 0.7 * pct) - this.slip) * Math.min(1, dt * 9)
+
+    // cámara con inercia: a más velocidad, más pegada; en maniobra, se retrasa
+    this.camLag += (this.x - this.camLag) * Math.min(1, dt * (3.4 + 4.2 * pct))
+
+    // suspensión: muelle amortiguado excitado por el relieve + textura del asfalto
+    const i = Math.floor(this.z / SEG)
+    const jolt = ((hillAt(i + 1) - 2 * hillAt(i) + hillAt(i - 1)) / SEG) * this.speed * 0.9
+    const textura = (hash(i) - 0.5) * pct * 26
+    this.suspV += (-this.susp * 170 - this.suspV * 15 + jolt + textura) * dt
+    this.susp += this.suspV * dt
+    this.susp = Math.max(-16, Math.min(16, this.susp))
+
+    this.shiftFlash = Math.max(0, this.shiftFlash - dt * 2.6)
   }
 
   /** Caja automática de 6 marchas: solo informativa + sonido del motor. */
@@ -320,6 +375,16 @@ export class Game {
     this.gear = Math.min(6, g)
     const lo = lim[this.gear - 1], hi = lim[this.gear] === 999 ? 210 : lim[this.gear]
     this.rpm = 0.18 + 0.82 * Math.max(0, Math.min(1, (v - lo) / (hi - lo)))
+
+    // cambio de marcha: la caída de vueltas ya sale sola del mapeo anterior;
+    // aquí solo señalizamos el evento para el sonido y el destello del HUD.
+    if (this.gear !== this.prevGear) {
+      this.gearChanged = this.gear > this.prevGear ? 1 : -1
+      this.shiftFlash = 1
+      this.prevGear = this.gear
+    } else {
+      this.gearChanged = 0
+    }
   }
 }
 
@@ -334,6 +399,7 @@ export class EngineAudio {
   private gain: GainNode | null = null
   private windGain: GainNode | null = null
   private windLP: BiquadFilterNode | null = null
+  private tireGain: GainNode | null = null
   muted = false
 
   start() {
@@ -361,21 +427,50 @@ export class EngineAudio {
       const wg = a.createGain(); wg.gain.value = 0
       src.connect(wlp); wlp.connect(wg); wg.connect(a.destination); src.start()
       this.windGain = wg; this.windLP = wlp
+
+      // chirrido de neumáticos: mismo ruido, pasa-banda agudo y ganancia
+      // gobernada por la carga lateral del chasis
+      const tsrc = a.createBufferSource(); tsrc.buffer = buf; tsrc.loop = true
+      const bp = a.createBiquadFilter(); bp.type = 'bandpass'; bp.frequency.value = 2400; bp.Q.value = 6
+      const tg = a.createGain(); tg.gain.value = 0
+      tsrc.connect(bp); bp.connect(tg); tg.connect(a.destination); tsrc.start()
+      this.tireGain = tg
     } catch { /* sin audio disponible */ }
   }
 
+  /** Golpe seco del cambio de marcha (clunk de transmisión). */
+  shift() {
+    const a = this.ctx
+    if (!a || this.muted) return
+    const t = a.currentTime
+    const o = a.createOscillator(); o.type = 'triangle'
+    o.frequency.setValueAtTime(190, t)
+    o.frequency.exponentialRampToValueAtTime(72, t + 0.09)
+    const g = a.createGain()
+    g.gain.setValueAtTime(0.0001, t)
+    g.gain.exponentialRampToValueAtTime(0.06, t + 0.008)
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.13)
+    o.connect(g); g.connect(a.destination)
+    o.start(t); o.stop(t + 0.16)
+  }
+
   /** Llamar cada frame: la marcha hace que el tono "reinicie" al cambiar. */
-  update(rpm: number, speedPct: number, throttle: boolean) {
+  update(rpm: number, speedPct: number, throttle: boolean, lateralG = 0, offroad = 0) {
     const a = this.ctx
     if (!a || !this.gain || !this.osc1 || !this.osc2 || !this.windGain || !this.windLP) return
     const t = a.currentTime
     const vol = this.muted ? 0 : 1
     const f = 58 + rpm * 150
-    this.osc1.frequency.setTargetAtTime(f, t, 0.08)
-    this.osc2.frequency.setTargetAtTime(f * 0.5, t, 0.08)
-    this.gain.gain.setTargetAtTime(vol * (throttle ? 0.085 : 0.045) * (0.45 + 0.55 * rpm), t, 0.12)
+    this.osc1.frequency.setTargetAtTime(f, t, 0.05)
+    this.osc2.frequency.setTargetAtTime(f * 0.5, t, 0.05)
+    this.gain.gain.setTargetAtTime(vol * (throttle ? 0.085 : 0.045) * (0.45 + 0.55 * rpm), t, 0.1)
     this.windGain.gain.setTargetAtTime(vol * 0.055 * speedPct * speedPct, t, 0.2)
     this.windLP.frequency.setTargetAtTime(500 + speedPct * 2600, t, 0.2)
+    if (this.tireGain) {
+      // chirría al cargar el tren delantero y rechina sobre la banquina
+      const carga = Math.max(0, lateralG - 0.38) * speedPct
+      this.tireGain.gain.setTargetAtTime(vol * (carga * 0.11 + offroad * 0.05 * speedPct), t, 0.1)
+    }
   }
 
   stop() {

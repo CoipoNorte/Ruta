@@ -7,7 +7,8 @@
  * después los sprites de lejos a cerca. Ciclo día/noche según el kilometraje.
  * ==========================================================================*/
 import {
-  SEG, ROAD_W, DRAW, CAM_H, CAM_DEPTH, Game, curveAt, hillAt, hash, kmh,
+  SEG, ROAD_W, DRAW, CAM_H, CAM_DEPTH, PLAYER_W, PLAYER_Z,
+  Game, curveAt, hillAt, hash, kmh,
 } from './engine'
 
 /* ------------------------------- PALETAS ---------------------------------- */
@@ -113,10 +114,25 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
   const pal = palette(g.km)
   const base = Math.floor(g.z / SEG)
   const pct = (g.z % SEG) / SEG
-  const camX = g.x * ROAD_W
-  const camY = CAM_H + hillAt(base) + (hillAt(base + 1) - hillAt(base)) * pct
+  /* CÁMARA DINÁMICA
+   * · camLag: persigue al coche con inercia → el coche se desplaza DENTRO del
+   *   encuadre al maniobrar (clave de la sensación de simulador).
+   * · susp: la suspensión mueve la cámara verticalmente sobre el relieve.
+   * · camDepth: el FOV se abre con la velocidad → sensación de rapidez. */
+  const camX = g.camLag * ROAD_W
+  const camY = CAM_H + hillAt(base) + (hillAt(base + 1) - hillAt(base)) * pct + g.susp * 7
   const camZ = g.z
+  const camDepth = CAM_DEPTH * (1 - 0.11 * g.speedPct)
   const horizonBias = (hillAt(base) - hillAt(base + 24)) * 0.00002
+
+  /* Cabeceo y balanceo aplicados a TODA la escena (como una cámara real
+   * montada en el chasis). Se escala un 8 % para que la rotación no descubra
+   * las esquinas del lienzo. */
+  ctx.save()
+  ctx.translate(W / 2, H / 2)
+  ctx.rotate(-g.roll * 0.030)
+  ctx.scale(1.08, 1.08)
+  ctx.translate(-W / 2, -H / 2 + g.pitch * H * 0.026 - g.susp * 0.9)
 
   /* ------------------------------- CIELO -------------------------------- */
   const sky = ctx.createLinearGradient(0, 0, 0, H * 0.62)
@@ -170,7 +186,7 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
   let x = 0
   let dx = -curveAt(base) * pct
   let maxY = H
-  const scaleOf = (z: number) => CAM_DEPTH / Math.max(z - camZ, 1)
+  const scaleOf = (z: number) => camDepth / Math.max(z - camZ, 1)
 
   for (let n = 0; n <= DRAW; n++) {
     const i = base + n
@@ -302,11 +318,24 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
   sprites.sort((a, b) => b.z - a.z)
   for (const s of sprites) s.draw()
 
-  /* ------------------------------ COCHE PROPIO ---------------------------- */
-  const bob = Math.sin(g.time * 7) * (0.6 + g.speedPct * 1.2) + (g.shake > 0 ? Math.sin(g.time * 47) * g.shake * 3.4 : 0)
-  const pw = W * 0.34
-  const px = W / 2 - g.steer * W * 0.035 + (g.shake > 0 ? Math.sin(g.time * 39) * g.shake * 4 : 0)
-  const py = H * 0.925 + bob
+  /* ------------------------------ COCHE PROPIO ----------------------------
+   * MISMA proyección que el tráfico: el coche es un sprite situado a PLAYER_Z
+   * de la cámara, por lo que su tamaño en pantalla sale de la perspectiva y
+   * no de un porcentaje fijo. Así la escala con los demás vehículos es exacta.
+   *   escala  = CAM_DEPTH / PLAYER_Z
+   *   ancho   = escala · PLAYER_W · 2.1 · W/2      (idéntico a drawCar del tráfico)
+   *   baseY   = H/2 + escala · CAM_H · H/2         (el suelo bajo la cámara)
+   * ----------------------------------------------------------------------*/
+  const sP = camDepth / PLAYER_Z
+  const pw = sP * PLAYER_W * 2.1 * W / 2
+  // posición real del coche sobre la calzada a PLAYER_Z por delante de la cámara
+  const fnP = PLAYER_Z / SEG
+  const nP = Math.floor(fnP), frP = fnP - nP
+  const roadXP = xw[nP] + (xw[nP + 1] - xw[nP]) * frP
+  const roadYP = yw[nP] + (yw[nP + 1] - yw[nP]) * frP
+  const bob = Math.sin(g.time * 7) * (0.3 + g.speedPct * 0.7) + (g.shake > 0 ? Math.sin(g.time * 47) * g.shake * 3.4 : 0)
+  const px = W / 2 + sP * (roadXP + g.x * ROAD_W - camX) * W / 2 + (g.shake > 0 ? Math.sin(g.time * 39) * g.shake * 4 : 0)
+  const py = H / 2 - sP * (roadYP - camY) * H / 2 + bob
 
   // faros encendidos de noche
   if (pal.dark > 0.25) {
@@ -322,8 +351,11 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
 
   ctx.save()
   ctx.translate(px, py)
-  ctx.rotate(-g.steer * 0.035)
-  drawCar(ctx, 0, 0, pw, '#E04A2F', pal.dark, false, false, 0, g.time)
+  // deriva (el morro apunta al giro) + contrabalanceo de carrocería
+  ctx.rotate(g.slip * 0.10 - g.roll * 0.05)
+  // squat/dive: se comprime al frenar, se estira al acelerar
+  ctx.scale(1, 1 - g.pitch * 0.07)
+  drawCar(ctx, 0, 0, pw, '#E04A2F', pal.dark, false, g.courtesy > 0, 0, g.time)
   ctx.restore()
 
   /* -------------------------- EFECTOS DE VELOCIDAD ------------------------ */
@@ -341,6 +373,9 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     }
     ctx.restore()
   }
+
+  /* Fin de la cámara del chasis: los efectos de pantalla van sin transformar */
+  ctx.restore()
 
   // viñeta + aviso de cortesía (nunca hay choque, solo aviso amable)
   const vg = ctx.createRadialGradient(W / 2, H * 0.55, H * 0.28, W / 2, H * 0.55, H * 0.85)

@@ -21,7 +21,18 @@ import { render } from '@/game/render'
 import { cn } from '@/utils/cn'
 
 type Fase = 'intro' | 'corriendo' | 'pausa'
-const MAX_DRAG = 110 // px de recorrido del volante hasta el tope
+/* Recorrido del dedo hasta el tope de giro. Se adapta al ancho real de la
+ * pantalla (≈22 %, acotado) para que el gesto sea igual de cómodo en un móvil
+ * pequeño que en una tablet. Corto = reacción inmediata; la curva de respuesta
+ * devuelve la precisión cerca del centro. */
+const dragFor = (w: number) => Math.max(62, Math.min(110, w * 0.22))
+
+/** Curva de respuesta del volante: suave al inicio (correcciones finas de
+ *  carril) y lineal al final (maniobras rápidas). |x|^1.35 conserva el signo. */
+const steerCurve = (d: number) => {
+  const c = Math.max(-1, Math.min(1, d))
+  return Math.sign(c) * Math.pow(Math.abs(c), 1.35)
+}
 
 const fmtTime = (s: number) => {
   const m = Math.floor(s / 60)
@@ -39,10 +50,14 @@ export default function Drive() {
   const [fase, setFase] = useState<Fase>('intro')
   const [lock, setLock] = useState(false)       // traba del acelerador (crucero)
   const [muted, setMuted] = useState(false)
-  const [hud, setHud] = useState({ km: 0, vel: 0, gear: 1, time: 0, ovt: 0, flow: 1, rpm: 0 })
+  const [hud, setHud] = useState({ km: 0, vel: 0, gear: 1, time: 0, ovt: 0, flow: 1, rpm: 0, shift: 0 })
 
   const lockRef = useRef(lock); lockRef.current = lock
   const steerTouch = useRef<{ id: number; x0: number } | null>(null)
+  const lastBuzz = useRef(0)
+  const dragRef = useRef(84)
+  /** Punto donde el jugador agarró el volante virtual (para el anillo guía). */
+  const [grab, setGrab] = useState({ on: false, x: 0, y: 0 })
 
   /* ---------------------------- bucle principal --------------------------- */
   useEffect(() => {
@@ -57,6 +72,7 @@ export default function Drive() {
       W = cv.clientWidth; H = cv.clientHeight
       cv.width = Math.floor(W * dpr); cv.height = Math.floor(H * dpr)
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      dragRef.current = dragFor(W)
     }
     resize()
     window.addEventListener('resize', resize)
@@ -78,7 +94,16 @@ export default function Drive() {
           throttle: (i.throttle || lockRef.current) && !i.brake,
           brake: i.brake,
         })
-        audioRef.current.update(g.rpm, g.speedPct, i.throttle || lockRef.current)
+        audioRef.current.update(
+          g.rpm, g.speedPct, i.throttle || lockRef.current,
+          g.lateralG, g.shake,
+        )
+        // eventos de chasis → sonido y háptica
+        if (g.gearChanged !== 0) audioRef.current.shift()
+        if (g.shake > 0.5 && now - lastBuzz.current > 320) {
+          lastBuzz.current = now
+          navigator.vibrate?.(18)   // vibra solo al pisar la banquina
+        }
       }
 
       render(ctx, g, W, H)
@@ -86,7 +111,7 @@ export default function Drive() {
       hudAcc += dt
       if (hudAcc > 0.08) {
         hudAcc = 0
-        setHud({ km: g.km, vel: Math.round(kmh(g.speed)), gear: g.gear, time: g.time, ovt: g.overtakes, flow: g.flow, rpm: g.rpm })
+        setHud({ km: g.km, vel: Math.round(kmh(g.speed)), gear: g.gear, time: g.time, ovt: g.overtakes, flow: g.flow, rpm: g.rpm, shift: g.shiftFlash })
       }
     }
     rafRef.current = requestAnimationFrame(loop)
@@ -116,18 +141,29 @@ export default function Drive() {
 
   const reanudar = useCallback(() => { audioRef.current.start(); setFaseBoth('corriendo') }, [setFaseBoth])
 
-  /* volante: cualquier arrastre horizontal en su zona */
+  /* ------------------------------- VOLANTE --------------------------------
+   * TODA la pantalla es superficie de dirección: se agarra donde se quiera
+   * (izquierda, derecha, centro) y con cualquier mano. El punto donde apoyas
+   * el dedo se convierte en el "centro" del volante virtual, así que no hay
+   * que buscar ninguna zona concreta ni mirar la pantalla.
+   *
+   * Multitáctil: solo el PRIMER puntero que aterriza dirige; los siguientes
+   * se ignoran aquí y quedan libres para los pedales (que están por encima
+   * en z-index y reciben sus propios eventos).
+   * ----------------------------------------------------------------------*/
   const onWheelDown = (e: React.PointerEvent) => {
     if (faseRef.current !== 'corriendo') return
+    if (steerTouch.current) return                 // ya hay un dedo dirigiendo
     e.currentTarget.setPointerCapture(e.pointerId)
     steerTouch.current = { id: e.pointerId, x0: e.clientX }
     inputRef.current.steering = true
+    inputRef.current.steer = 0
+    setGrab({ on: true, x: e.clientX, y: e.clientY })
   }
   const onWheelMove = (e: React.PointerEvent) => {
     const t = steerTouch.current
     if (!t || t.id !== e.pointerId) return
-    const d = (e.clientX - t.x0) / MAX_DRAG
-    inputRef.current.steer = Math.max(-1, Math.min(1, d))
+    inputRef.current.steer = steerCurve((e.clientX - t.x0) / dragRef.current)
   }
   const onWheelUp = (e: React.PointerEvent) => {
     const t = steerTouch.current
@@ -135,6 +171,7 @@ export default function Drive() {
     steerTouch.current = null
     inputRef.current.steering = false   // el motor lo devuelve al centro solo
     inputRef.current.steer = 0
+    setGrab((g) => ({ ...g, on: false }))
   }
 
   const hold = (campo: 'throttle' | 'brake') => ({
@@ -236,40 +273,74 @@ export default function Drive() {
         </div>
       </div>
 
-      {/* ============================== VELOCÍMETRO ========================== */}
-      <div className="pointer-events-none absolute bottom-44 left-1/2 z-20 -translate-x-1/2 text-center">
-        <p className="font-mono text-6xl font-bold leading-none tabular-nums drop-shadow-[0_2px_12px_rgba(0,0,0,0.8)]">
-          {hud.vel}
-        </p>
-        <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-white/60">km/h · D{hud.gear}</p>
-        <div className="mx-auto mt-1.5 h-1 w-28 overflow-hidden rounded-full bg-white/15">
-          <div
-            className={cn('h-full rounded-full transition-[width] duration-150', velPct > 0.82 ? 'bg-red-400' : 'bg-white/80')}
-            style={{ width: `${velPct * 100}%` }}
-          />
+      {/* ============================== VELOCÍMETRO ==========================
+          Reubicado al tercio superior: no tapa la calzada ni los pedales y
+          queda en la línea de visión natural, como un head-up display. */}
+      <div className="pointer-events-none absolute left-1/2 top-[20%] z-20 -translate-x-1/2 text-center">
+        <div className="flex items-end justify-center gap-2">
+          <p className="font-mono text-[4.2rem] font-bold leading-[0.85] tabular-nums drop-shadow-[0_2px_16px_rgba(0,0,0,0.9)]">
+            {hud.vel}
+          </p>
+          <span className="mb-2 font-mono text-[11px] uppercase tracking-[0.2em] text-white/55">km/h</span>
+        </div>
+        {/* barra de revoluciones + marcha actual */}
+        <div className="mx-auto mt-2 flex items-center gap-2">
+          <div className="h-1.5 w-32 overflow-hidden rounded-full bg-black/40 ring-1 ring-white/10">
+            <div
+              className={cn('h-full rounded-full transition-[width] duration-100', hud.rpm > 0.88 ? 'bg-red-400' : velPct > 0.82 ? 'bg-amber-300' : 'bg-white/85')}
+              style={{ width: `${hud.rpm * 100}%` }}
+            />
+          </div>
+          <span
+            className={cn(
+              'grid size-7 place-items-center rounded-md border font-mono text-xs font-bold transition-all duration-200',
+              hud.shift > 0.1 ? 'scale-110 border-signal bg-signal text-ink' : 'border-white/20 bg-black/40 text-white/80',
+            )}
+          >
+            {hud.gear}
+          </span>
         </div>
       </div>
 
-      {/* ================================ VOLANTE ============================ */}
+      {/* ===================== SUPERFICIE DE DIRECCIÓN =======================
+          Capa a pantalla completa (z-10): queda POR DEBAJO del HUD, los pedales
+          y los overlays, así que esos siguen recibiendo sus propios toques.
+          Agarra donde quieras, con la mano que quieras. */}
       <div
         onPointerDown={onWheelDown}
         onPointerMove={onWheelMove}
         onPointerUp={onWheelUp}
         onPointerCancel={onWheelUp}
-        className="absolute bottom-0 left-0 z-20 h-40 w-[62%] touch-none"
-      >
-        <div className="absolute inset-x-4 bottom-6 rounded-2xl border border-white/10 bg-black/35 p-3 backdrop-blur-sm">
+        className="absolute inset-0 z-10 touch-none"
+      />
+
+      {/* Anillo guía en el punto de agarre: feedback de que el dedo manda */}
+      {grab.on && (
+        <div
+          className="pointer-events-none absolute z-20"
+          style={{ left: grab.x, top: grab.y, transform: 'translate(-50%,-50%)' }}
+        >
+          <div className="relative grid size-24 place-items-center rounded-full border border-white/20 bg-white/5 backdrop-blur-[2px]">
+            <div className="h-px w-16 bg-white/20" />
+            <GrabKnob gameRef={gameRef} />
+          </div>
+        </div>
+      )}
+
+      {/* ========================= INDICADOR DE VOLANTE ======================
+          Solo informativo (pointer-events-none): el control real es la pantalla. */}
+      <div className="pointer-events-none absolute bottom-6 left-4 z-20 w-[52%] max-w-64">
+        <div className="rounded-2xl border border-white/10 bg-black/35 p-3 backdrop-blur-sm">
           <div className="flex items-center justify-between font-mono text-[9px] uppercase tracking-[0.2em] text-white/45">
             <span className="flex items-center gap-1"><Navigation className="size-3" /> volante</span>
             <span>vuelve solo</span>
           </div>
-          {/* riel del volante */}
           <div className="relative mt-2 h-9 rounded-full border border-white/10 bg-black/40">
             <div className="absolute left-1/2 top-1/2 h-5 w-px -translate-x-1/2 -translate-y-1/2 bg-white/20" />
             <SteerKnob inputRef={inputRef} gameRef={gameRef} />
           </div>
           <p className="mt-1.5 text-center font-mono text-[9px] uppercase tracking-[0.18em] text-white/35">
-            arrastra el dedo ← →
+            desliza en cualquier parte
           </p>
         </div>
       </div>
@@ -324,7 +395,7 @@ export default function Drive() {
                     adelantar con calma y ver subir los kilómetros.
                   </p>
                   <ul className="mt-5 space-y-2 text-left font-mono text-[11px] text-white/60">
-                    <li className="flex gap-2"><Navigation className="mt-px size-3.5 shrink-0 text-signal" /> Arrastra el dedo abajo-izquierda: es el volante, vuelve solo al centro.</li>
+                    <li className="flex gap-2"><Navigation className="mt-px size-3.5 shrink-0 text-signal" /> Desliza el dedo <strong className="text-white/80">en cualquier parte</strong> de la pantalla: es el volante. Al soltar vuelve solo al centro.</li>
                     <li className="flex gap-2"><Gauge className="mt-px size-3.5 shrink-0 text-signal" /> Caja automática: solo acelerar y frenar.</li>
                     <li className="flex gap-2"><Lock className="mt-px size-3.5 shrink-0 text-signal" /> TRABA mantiene el acelerador: conduce con una mano.</li>
                   </ul>
@@ -368,8 +439,32 @@ export default function Drive() {
 }
 
 /* -------------------------------------------------------------------------
- * Perilla del volante: se anima leyendo el estado real del motor (incluido
- * el auto-centrado), fuera del ciclo de render de React.
+ * Perilla dentro del anillo de agarre: sigue al dedo en el punto donde se
+ * apoyó. Se anima por rAF leyendo el motor, sin re-render de React.
+ * ------------------------------------------------------------------------*/
+function GrabKnob({ gameRef }: { gameRef: React.RefObject<Game> }) {
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    let id = 0
+    const tick = () => {
+      id = requestAnimationFrame(tick)
+      const el = ref.current
+      if (el) el.style.transform = `translate(calc(-50% + ${gameRef.current.steer * 34}px), -50%)`
+    }
+    id = requestAnimationFrame(tick)
+    return () => cancelAnimationFrame(id)
+  }, [gameRef])
+  return (
+    <div
+      ref={ref}
+      className="absolute left-1/2 top-1/2 size-9 rounded-full border-2 border-white/60 bg-white/25 shadow-lg"
+    />
+  )
+}
+
+/* -------------------------------------------------------------------------
+ * Perilla del indicador inferior: se anima leyendo el estado real del motor
+ * (incluido el auto-centrado), fuera del ciclo de render de React.
  * ------------------------------------------------------------------------*/
 function SteerKnob({ inputRef, gameRef }: {
   inputRef: React.RefObject<{ steer: number; steering: boolean; throttle: boolean; brake: boolean }>
