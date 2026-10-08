@@ -97,6 +97,27 @@ screenY = H/2 − scale · (yMundo − camY) · H/2
   la cámara y nosotros se dibuja **por delante**. Antes el jugador se pintaba
   siempre el último y parecía atravesar a los demás. Los faros, en cambio, se
   pintan antes que los sprites (son luz proyectada sobre el asfalto).
+- **Biomas** (`biomeAt`): cada **7,5 km** cambia el paisaje, con transición
+  suavizada por coseno en el último 30 % del tramo. Ocho terrenos inspirados en
+  recorrer un país largo y estrecho de norte a sur:
+
+  | Bioma | Terreno | Decoración |
+  |---|---|---|
+  | Desierto | ocre | cactus columnares con brazos |
+  | Valle | verde cálido | árboles de hoja ancha |
+  | Ciudad | gris | edificios con **ventanas que se encienden de noche** |
+  | Bosque | verde profundo | coníferas de copa triangular en dos pisos |
+  | Sierra | pardo | peñascos con cara iluminada |
+  | Cordillera | gris azulado | pinos nevados, manto blanco al 75 % |
+  | Patagonia | estepa seca | matorrales bajos |
+  | Austral | blanco | hielo, manto al 100 % |
+
+  Cada bioma tiñe césped, colinas, niebla y cielo (este último **solo de día**,
+  ponderado por `1 − dark`), ajusta la **densidad** de vegetación y puede
+  aplicar **manto de nieve** que aclara terreno y arcenes. Las tres capas
+  —bioma, ciclo diario y lluvia— se combinan: un bosque nevado de noche bajo
+  la lluvia se ve coherente. El nombre del paisaje aparece en el odómetro.
+
 - **Ciclo día/noche** cada 34 km con **fases de duración desigual** (día largo,
   crepúsculos breves, noche contenida) definidas en `FASES[]` por fracción `t`
   e interpoladas con suavizado coseno para que no haya cortes. El **sol/luna
@@ -161,6 +182,34 @@ screenY = H/2 − scale · (yMundo − camY) · H/2
      4 y se adelanta su evaluación de cortesía (`checkT = 0.35 s`), de modo que
      se aparta **con intermitente** y solo si el carril está libre.
   5. Destello rojo perimetral mientras dura el contacto. Sin daños ni derrota.
+
+### Garantía de corredor (siempre hay camino)
+Regla de oro del juego: **nunca debe faltar una ruta por delante**. Se ataca en
+dos frentes, prevención y corrección.
+
+**1. Prevención — regla anti-pelotón (`unclump`)**
+El 90 % de los bloqueos nacen de coches rodando **en paralelo a la misma
+velocidad**: nunca se separan solos. Se detectan en cuanto se emparejan
+(carriles contiguos, solape longitudinal, diferencia de ritmo <220 u/s) y, si
+llevan **más de 2,5 s** así, el de menos prisa recibe `relax` y el de más prisa
+`boost`. Se escalonan igual que en el tráfico real.
+Además, al reciclarse un vehículo se **escalona en el spawn**: si aparece a la
+altura de otro en un carril contiguo, se le suman 26–44 m. El tráfico ya no
+nace formando barreras.
+
+**2. Corrección — escalada por tiempo sin ruta**
+Cada frame se mide el hueco libre de cada carril (`laneGaps`) y se compara con
+lo necesario para pasar (`PLAYER_L + 1100 + speed`). Si el mejor no alcanza,
+sube `blockT` y la intervención se intensifica sobre el **carril más
+prometedor** (el que ya tiene más hueco):
+
+| Tiempo sin ruta | Intervención |
+|---|---|
+| > 1,5 s | `makeWay`: el tapón acelera a `max(jugador·1.15, desired·1.1)` |
+| > 3,0 s | Orden de despejar: cambia de carril señalizando, abortando lo que hiciera |
+| > 5,0 s | Prioridad total: se desplaza aunque el carril no esté perfecto y **sus vecinos le hacen sitio** (efecto cremallera con `relax` + `nudge`) |
+
+El jugador no ve nada de esto: solo percibe que el tráfico **se abre**.
 
 ### Verificación de huecos (anti-barrera rodante)
 Problema clásico del tráfico simulado: tres coches a velocidad parecida acaban
@@ -241,6 +290,8 @@ Efectos encadenados:
   `speedPct` (viento relativo) y la densidad de la intensidad.
 
 ### Retrovisor
+Situado en `max(H·0.135, 94)` px para quedar **por debajo del HUD superior**
+(odómetro + barra de conducción) también en pantallas de móvil pequeñas.
 `Game.behind(maxDist)` devuelve el tráfico que llega por detrás; `drawMirror()`
 lo pinta como **inset dentro del mismo canvas** (sin segundo lienzo) con líneas
 de fuga, escala `pow(1 − d/16000, 2.1)` y la convención real del espejo
@@ -281,18 +332,49 @@ agresividad al adelantar.
 
 | Tipo | Mezcla | Velocidad objetivo | Carril natural | Comportamiento |
 |---|---|---|---|---|
-| `sinprisa` | ~42 % | **0,80–0,87 × límite** (10–20 km/h por debajo) | derecho (0) | Disfruta el viaje, casi nunca abandona la derecha (umbral de estorbo 0,82). Incluye los camiones |
-| `conprisa` | ~38 % | 0,95–1,00 × límite | derecho/centro | Respeta las normas, adelanta **solo si gana ≥8 %** y vuelve a la derecha en cuanto puede |
-| `corredor` | ~15 % | **1,12–1,28 × límite** | izquierdo | Temerario: se cambia por cualquier ganancia (≥2 %), señaliza apenas 0,2 s y **bordea el límite de la calzada** si no hay carril libre |
-| `ambulancia` | 1,5 % | 1,30 × límite | izquierdo | Corredor con **prioridad**: el resto se aparta |
-| `patrulla` | 3 % | 0,98–1,04 × límite | izquierdo | Patrulla normal hasta que detecta un corredor |
+| `sinprisa` | ~34 % | **0,74–0,91 × límite** | derecho (0) | Disfruta el viaje, casi nunca abandona la derecha (umbral de estorbo 0,85) |
+| `conprisa` | ~32 % | 0,92–1,05 × límite | derecho, o centro si tiene prisa | Respeta las normas, adelanta **solo si gana ≥7 %** y vuelve a la derecha |
+| `corredor` | ~15 % | **hasta `MAX_SPEED · 0.96`** | izquierdo | **Ignora el límite por completo**: su techo es el del propio vehículo. Se cambia por cualquier ganancia (≥2 %), señaliza 0,2 s y **bordea el borde de la calzada** si no hay carril libre |
+| `camion` | ~14 % | `(0,74–0,86) × límite × (1 − carga·0,16)` | derecho, **nunca el rápido** (`maxLane = 1`) | Lleva `cargo ∈ [0,1]`: a más carga, menos brío. La carga se ve sobre la caja |
+| `ambulancia` | 1,5 % | hasta `MAX_SPEED · 0.92` | izquierdo | Prioridad absoluta: **toca la bocina** y, si no le abren hueco, **embiste lateralmente** |
+| `patrulla` | 4 % | de ronda (0,88×) o con prisa (1,02–1,22×) | según humor | Solo las patrullas **con prisa** (`mood > 0.5`) salen a perseguir corredores |
 
-Los corredores y las emergencias **ignoran el límite**; el resto lo respeta.
+**Humor dinámico** (`mood ∈ [0,1]`): cada **8–30 s** el conductor se replantea su
+prisa con una deriva suave (±0,27), y su velocidad deseada se recalcula
+**continuamente** contra el límite del tramo en el que esté. Además los civiles
+pueden **cambiar de rol** con el tiempo: un `conprisa` muy acelerado (`mood > 0.93`)
+se convierte en `corredor`, y un `corredor` que se calma (`mood < 0.22`) vuelve a
+`conprisa`. El tráfico respira: unos aprietan en la recta, otros se descuelgan.
+
+**Límites por tramo**: `limitAt()` sortea cinco categorías cada ~2,7 km —
+60 (obras), 80 (travesía), 100, 120 (autopista) y 130 (tramo rápido). Los NPC
+ajustan su ritmo al cruzar cada zona, así que el tráfico se comprime y se estira
+solo. El jugador sigue libre de ir a su ritmo.
+
+### Maniobra de adelantamiento en tres fases
+Antes un NPC solo "cambiaba de carril"; ahora ejecuta un adelantamiento real
+con máquina de estados (`ovPhase`):
+
+1. **Salida** — detecta al líder que le estorba, guarda su id en `ovTarget`,
+   señaliza a la izquierda y se desplaza.
+2. **Paso** (`ovPhase = 1`) — acelera hasta `min(desired·1.12, presa·1.16)`
+   para **rebasar de verdad**, nunca quedarse en paralelo.
+3. **Reincorporación** (`ovPhase = 2`) — cuando ha dejado al otro atrás con
+   margen (`largo + 900 + speed·0.45`), señaliza a la derecha y **se coloca
+   delante** en cuanto el carril está libre.
+
+`ovT` limita la maniobra a 9 s: si se eterniza, se cancela y vuelve a la
+derecha, de modo que nadie se queda a vivir en el carril rápido.
 
 ### Emergencias y control policial
 - **Cesión de paso**: si una sirena activa se acerca por detrás a menos de 70 m
-  y en línea con un vehículo, este señaliza a la derecha, se desplaza `+0.14`
-  dentro de su carril y afloja al 90 %.
+  y en línea con un vehículo, este señaliza a la derecha, se desplaza `+0.16`
+  dentro de su carril, aborta cualquier adelantamiento y afloja al 88 %.
+- **Bocina y embestida**: a menos de 26 m la ambulancia **toca la bocina**
+  (claxon de dos tonos en quinta, sintetizado; suena si está a menos de 140 m
+  del jugador, con ondas visibles sobre el techo). Si a menos de 15 m el
+  vehículo sigue estorbando porque no tiene hueco, la ambulancia **lo embiste**
+  lateralmente (`nudge += 0.5·dt`) para abrirse paso.
 - **Persecución**: una patrulla libre busca un `corredor` a menos de 120 m, le
   asigna `chasing` y eleva su objetivo a velocidad de ambulancia. Al ponerse a
   su altura (<18 m) activa `pullover = 7 s` en **ambos**: los dos se van al
@@ -344,7 +426,8 @@ Cada coche (`TrafficCar`) conduce "bien":
 |---|---|
 | **Volante = toda la pantalla** | Capa a pantalla completa (z-10) bajo HUD/pedales. El punto donde apoyas el dedo se vuelve el centro del volante virtual: `pointerdown` fija `x0` y el arrastre da `steer = curva((x−x0)/drag)` con `curva(d) = sign(d)·\|d\|^1.35` (preciso al centro, rápido en los extremos) |
 | Recorrido adaptativo | `drag = clamp(ancho·0.22, 62, 110)` px → mismo gesto en móvil pequeño o tablet |
-| Multitáctil | Solo el **primer** puntero dirige; los demás quedan libres para los pedales, que están por encima en z-index y reciben sus propios eventos → se puede acelerar y girar a la vez, con una o dos manos |
+| Multitáctil | Cada puntero se identifica por `pointerId`: el **primero** dirige y los demás quedan libres para los pedales. Se puede **mantener el giro con un pulgar mientras el otro acelera y frena** sin que la dirección se interrumpa |
+| Re-enganche | Si el sistema cancela el puntero del volante (gesto del SO, notificación) y el dedo sigue apoyado, el siguiente `pointermove` **lo recupera** tomando la posición actual como nuevo centro. No hay que levantar y volver a pulsar |
 | Anillo guía | Aparece en el punto de agarre con una perilla que sigue al dedo (animada por rAF leyendo `game.steer`) |
 | Auto-centrado | Al soltar, `steering = false` y el motor interpola `steer → 0` a `RETURN_RATE = 10`/s (muelle en la simulación, no en la UI) |
 | Acelerador / freno | Botones `pointerdown/up` con `setPointerCapture` en la columna derecha |
@@ -353,6 +436,12 @@ Cada coche (`TrafficCar`) conduce "bien":
 | Intermitentes | Dos botones de 32 px sobre los pedales, o `Q` / `E`; auto-apagado a los 6 s. **Se ven encendidos en el propio coche**, igual que las luces de freno al pisar el pedal |
 | **Modo zurdo** | Selector en el menú de pausa que mueve toda la columna de pedales a la izquierda. Se guarda en `localStorage['ruta-lado']`. El volante sigue siendo la pantalla completa, así que no cambia |
 | Teclado | Flechas/WASD, `ESPACIO` traba, `Q`/`E` intermitentes, `ESC` pausa (pruebas en escritorio) |
+
+> **Multitáctil y `pointerId`**: la red de seguridad que libera el volante
+> escuchaba `pointerup` en `window` **sin comprobar qué dedo se levantaba**, de
+> modo que soltar el acelerador cancelaba la dirección y había que re-apoyar el
+> pulgar. Ahora `soltarVolante(id?)` solo libera si el `pointerId` coincide con
+> el del puntero que dirige. No era una limitación del navegador.
 
 > **Long-press = clic derecho**: mantener el dedo sobre un pedal disparaba el
 > menú contextual del sistema e interrumpía la partida. Se corrige en tres

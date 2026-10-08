@@ -47,11 +47,14 @@ export const kmh = (u: number) => u * 0.036
 export const toKm = (u: number) => u / 100000
 const clamp01 = (v: number) => Math.max(0, Math.min(1, v))
 
-/** Límite legal del tramo (km/h). Zonas de ~2,7 km, deterministas. */
+/** Límite legal del tramo (km/h). Zonas de ~2,7 km, deterministas.
+ *  Cinco categorías: obras/urbano (60), travesía (80), normal (100),
+ *  autopista (120) y tramo rápido (130). Los NPC ajustan su ritmo al cruzar
+ *  cada zona, de modo que el tráfico se comprime y se estira solo. */
 export function limitAt(i: number): number {
   const zona = Math.floor(i / 900)
   const h = hash(zona * 1.7 + 0.3)
-  return h < 0.2 ? 80 : h < 0.72 ? 120 : 100
+  return h < 0.1 ? 60 : h < 0.28 ? 80 : h < 0.52 ? 100 : h < 0.85 ? 120 : 130
 }
 
 /** Meteorología: 0 seco … 1 lluvia fuerte. Función del kilometraje. */
@@ -99,9 +102,11 @@ export const laneCenter = (l: number) => 1 - ((2 * l + 1) / LANES)
  *  · ambulancia: corredor con prioridad — el resto se aparta.
  *  · patrulla : persigue corredores; al alcanzarlos ambos se orillan.
  * ========================================================================= */
-export type Kind = 'sinprisa' | 'conprisa' | 'corredor' | 'ambulancia' | 'patrulla'
+export type Kind = 'sinprisa' | 'conprisa' | 'corredor' | 'camion' | 'ambulancia' | 'patrulla'
 
 export const esEmergencia = (k: Kind) => k === 'ambulancia' || k === 'patrulla'
+/** Conductores civiles que pueden cambiar de humor con el tiempo. */
+export const esCivil = (k: Kind) => k === 'sinprisa' || k === 'conprisa' || k === 'corredor'
 
 export interface TrafficCar {
   id: number
@@ -131,6 +136,15 @@ export interface TrafficCar {
   nudge: number      // velocidad lateral residual del empujón (se amortigua)
   boost: number      // >0: acelera para abrir hueco longitudinal
   relax: number      // >0: afloja para deshacer una barrera rodante
+  cargo: number      // 0..1 carga del camión (más carga, menos brío)
+  mood: number       // 0..1 prisa ACTUAL — varía durante el viaje
+  moodT: number      // cuenta atrás para replantearse la prisa
+  ovPhase: 0 | 1 | 2 // maniobra de adelantamiento: 0 no · 1 pasando · 2 volviendo
+  ovTarget: number   // id del vehículo al que está adelantando
+  ovT: number        // tiempo máximo permitido en la maniobra (anti-bloqueo)
+  honk: number       // >0 tocando la bocina (ambulancias)
+  abreast: number    // segundos rodando en paralelo con otro (anti-pelotón)
+  makeWay: number    // >0: orden explícita de despejar el corredor del jugador
 }
 
 export interface Input {
@@ -183,6 +197,12 @@ export class Game {
   nudgeSelf = 0         // rebote lateral propio del golpe (amortiguado)
   barrierT = 0          // cuenta atrás de la verificación de huecos
   blockedAll = false    // true si los 3 carriles están cortados por delante
+  hornCue = 0           // 1 cuando suena una bocina cerca (lo consume la vista)
+  blockT = 0            // segundos seguidos sin corredor libre (escalada)
+  zona = ''             // nombre del paisaje actual (lo escribe el render)
+
+  /** Distancia absoluta de un vehículo al coche del jugador. */
+  pzDist(c: TrafficCar) { return Math.abs(c.z - this.pz) }
   score = 100           // puntuación de conducción 0..100
   lastSignal = 0        // dirección señalizada en los últimos segundos
   signalAge = 99
@@ -211,40 +231,56 @@ export class Game {
   private rollKind(): Kind {
     const r = Math.random()
     if (r < 0.015) return 'ambulancia'
-    if (r < 0.045) return 'patrulla'
+    if (r < 0.055) return 'patrulla'
     if (r < 0.20) return 'corredor'
-    if (r < 0.58) return 'conprisa'
+    if (r < 0.34) return 'camion'
+    if (r < 0.66) return 'conprisa'
     return 'sinprisa'
   }
 
-  /** Velocidad deseada según personalidad y límite legal del tramo. */
-  private paceFor(kind: Kind, limitKmh: number, truck: boolean): number {
+  /** Velocidad deseada: personalidad × límite del tramo × HUMOR actual.
+   *  `mood` (0..1) es la prisa del momento y cambia durante el viaje, así que
+   *  un mismo coche acelera o se relaja según el tramo y su estado de ánimo. */
+  private paceFor(kind: Kind, limitKmh: number, mood = 0.5, cargo = 0): number {
     const lim = limitKmh / 0.036
     switch (kind) {
-      case 'sinprisa':  return lim * (0.80 + Math.random() * 0.07)   // 10–20 km/h por debajo
-      case 'conprisa':  return lim * (0.95 + Math.random() * 0.05)   // en el límite
-      case 'corredor':  return lim * (1.12 + Math.random() * 0.16)   // por encima
-      case 'ambulancia': return lim * 1.30
-      case 'patrulla':  return lim * (0.98 + Math.random() * 0.06)
+      // 10–20 km/h por debajo; con algo de prisa se acerca al límite
+      case 'sinprisa':  return lim * (0.74 + mood * 0.17)
+      // en el límite, con margen según su humor
+      case 'conprisa':  return lim * (0.92 + mood * 0.13)
+      // IGNORA el límite: su techo es el del propio vehículo
+      case 'corredor':  return Math.min(MAX_SPEED * 0.96, lim * (1.12 + mood * 0.55))
+      // la carga pesa: un camión lleno pierde hasta un 16 % de ritmo
+      case 'camion':    return lim * (0.74 + mood * 0.12) * (1 - cargo * 0.16)
+      case 'ambulancia': return Math.min(MAX_SPEED * 0.92, lim * 1.38)
+      // patrulla: de ronda tranquila o con prisa, según humor
+      case 'patrulla':  return mood > 0.62 ? lim * (1.02 + mood * 0.2) : lim * (0.88 + mood * 0.12)
     }
-    return truck ? lim * 0.8 : lim
   }
 
   /** Carril preferido por personalidad (0 derecho … LANES-1 izquierdo). */
-  private homeLane(kind: Kind, truck: boolean): number {
-    if (truck || kind === 'sinprisa') return 0
-    if (kind === 'conprisa') return Math.random() < 0.6 ? 0 : 1
-    return LANES - 1                                  // corredores y emergencias
+  private homeLane(kind: Kind, mood = 0.5): number {
+    if (kind === 'camion' || kind === 'sinprisa') return 0
+    if (kind === 'conprisa') return mood > 0.65 ? 1 : 0
+    if (kind === 'patrulla') return mood > 0.62 ? 1 : 0
+    return LANES - 1                                  // corredores y ambulancias
   }
+
+  /** Carril máximo permitido: los camiones nunca pisan el carril rápido. */
+  private maxLaneFor(c: TrafficCar) { return c.kind === 'camion' ? 1 : LANES - 1 }
 
   private spawn(relZ: number) {
     const z = this.z + relZ
     const limKmh = limitAt(Math.floor(z / SEG))
-    let kind = this.rollKind()
-    const truck = kind === 'sinprisa' && Math.random() < 0.35
-    if (truck) kind = 'sinprisa'
-    const lane = this.homeLane(kind, truck)
-    const desired = this.paceFor(kind, limKmh, truck)
+    const kind = this.rollKind()
+    const truck = kind === 'camion'
+    const cargo = truck ? Math.random() : 0
+    // humor inicial: sesgado según la personalidad
+    const mood = kind === 'corredor' ? 0.6 + Math.random() * 0.4
+      : kind === 'sinprisa' ? Math.random() * 0.5
+      : Math.random()
+    const lane = this.homeLane(kind, mood)
+    const desired = this.paceFor(kind, limKmh, mood, cargo)
     const car: TrafficCar = {
       id: this.nextId++,
       z,
@@ -273,8 +309,28 @@ export class Game {
       nudge: 0,
       boost: 0,
       relax: 0,
+      cargo,
+      mood,
+      moodT: 8 + Math.random() * 22,
+      ovPhase: 0,
+      ovTarget: 0,
+      ovT: 0,
+      honk: 0,
+      abreast: 0,
+      makeWay: 0,
     }
     this.cars.push(car)
+  }
+
+  /** Vehículo líder real (objeto, no solo datos) para la maniobra de adelantar. */
+  private leaderCar(c: TrafficCar, lane: number): TrafficCar | null {
+    let best: TrafficCar | null = null
+    for (const o of this.cars) {
+      if (o.id === c.id || o.lane !== lane) continue
+      const d = o.z - c.z
+      if (d > 0 && d < 9000 && (!best || o.z < best.z)) best = o
+    }
+    return best
   }
 
   /** Coche más cercano por delante en un carril (incluye al jugador). */
@@ -332,6 +388,28 @@ export class Game {
     for (const c of this.cars) {
       c.cooldown -= dt
       c.yielding = Math.max(0, c.yielding - dt)
+      c.honk = Math.max(0, c.honk - dt)
+
+      /* --- HUMOR CAMBIANTE: cada 8–30 s el conductor se replantea su prisa.
+       * El valor deriva desde el anterior (nadie pasa de plácido a temerario
+       * de golpe) y se recalcula la velocidad deseada con el límite del tramo
+       * en el que esté. Esto hace que el tráfico respire: unos aprietan en la
+       * recta y otros se descuelgan. */
+      c.moodT -= dt
+      if (c.moodT <= 0) {
+        c.moodT = 8 + Math.random() * 22
+        const deriva = (Math.random() - 0.5) * 0.55
+        c.mood = Math.max(0, Math.min(1, c.mood + deriva))
+        // un conprisa muy acelerado puede volverse corredor, y al revés
+        if (esCivil(c.kind)) {
+          if (c.kind === 'conprisa' && c.mood > 0.93) c.kind = 'corredor'
+          else if (c.kind === 'corredor' && c.mood < 0.22) c.kind = 'conprisa'
+          else if (c.kind === 'sinprisa' && c.mood > 0.88) c.kind = 'conprisa'
+          else if (c.kind === 'conprisa' && c.mood < 0.12) c.kind = 'sinprisa'
+        }
+      }
+      // el ritmo se reevalúa continuamente contra el límite del tramo actual
+      c.desired = this.paceFor(c.kind, limitAt(Math.floor(c.z / SEG)), c.mood, c.cargo)
 
       /* --- ¿EL JUGADOR PIDE PASO? ----------------------------------------
        * Si lo llevamos pegado detrás, en su mismo carril y yendo nosotros más
@@ -379,6 +457,11 @@ export class Game {
        * razonable) · aflojar: se descuelga para romper la formación en muro */
       if (c.boost > 0) { c.boost -= dt; target = Math.max(target, Math.min(this.speed * 1.1, c.desired * 1.3)) }
       if (c.relax > 0) { c.relax -= dt; target = Math.min(target, c.desired * 0.82) }
+      /* orden de despejar el corredor del jugador: aprieta de verdad */
+      if (c.makeWay > 0) {
+        c.makeWay -= dt
+        target = Math.max(target, this.speed * 1.15, c.desired * 1.1)
+      }
 
       /* --- PERSONALIDAD: los corredores y emergencias ignoran el límite --- */
       if (c.kind === 'corredor' || esEmergencia(c.kind)) target = c.desired
@@ -395,7 +478,12 @@ export class Game {
             target = Math.min(target, 900)
             presa.lane = 0; c.lane = 0
             presa.blinker = 1; c.blinker = 1
-            if (c.pullover <= 0) { presa.kind = 'conprisa'; presa.desired = this.paceFor('conprisa', limitAt(Math.floor(presa.z / SEG)), false); c.chasing = 0 }
+            if (c.pullover <= 0) {
+              // el corredor "aprende": sale del control con humor calmado
+              presa.kind = 'conprisa'; presa.mood = 0.25; presa.moodT = 25
+              presa.desired = this.paceFor('conprisa', limitAt(Math.floor(presa.z / SEG)), 0.25)
+              c.chasing = 0; c.mood = 0.4
+            }
           } else {
             // alcanzarlo: acelera hasta ponerse a su altura
             target = presa.speed * 1.25
@@ -411,18 +499,28 @@ export class Game {
         c.x += (1.12 - c.x) * Math.min(1, dt * 1.2)   // pisa el arcén derecho
       }
 
-      /* --- CEDER EL PASO A EMERGENCIAS: si viene una sirena por detrás en
-       * nuestro carril, nos apartamos a la derecha y aflojamos. --- */
+      /* --- CEDER EL PASO A EMERGENCIAS -----------------------------------
+       * Si viene una sirena por detrás en nuestro carril nos apartamos. La
+       * ambulancia TOCA LA BOCINA; si pese a ello seguimos estorbando (sin
+       * hueco libre), nos EMBISTE lateralmente para abrirse paso. */
       if (!esEmergencia(c.kind) && c.pullover <= 0) {
         for (const e of this.cars) {
           if (!esEmergencia(e.kind) || (e.kind === 'patrulla' && !e.chasing)) continue
           const d = c.z - e.z
           if (d > 0 && d < 7000 && Math.abs(e.x - c.x) < 0.75) {
+            const cerca = d < 2600
+            if (cerca && e.kind === 'ambulancia') {
+              e.honk = 0.9
+              if (this.pzDist(e) < 14000) this.hornCue = 1     // se oye desde el coche
+            }
             if (c.lane > 0 && c.intent === 0 && this.laneFree(c.z, c.lane - 1, c.id)) {
               c.intent = 1; c.intentT = 0.3
+              c.ovPhase = 0                                     // aborta lo que hiciera
             }
-            c.x += (laneCenter(c.lane) + 0.14 - c.x) * Math.min(1, dt * 1.5)
-            target = Math.min(target, c.desired * 0.9)
+            // se arrima dentro del carril; si está pegada, embestida lateral
+            c.x += (laneCenter(c.lane) + 0.16 - c.x) * Math.min(1, dt * 1.8)
+            if (cerca && d < 1500) c.nudge += 0.5 * dt
+            target = Math.min(target, c.desired * 0.88)
             break
           }
         }
@@ -448,7 +546,7 @@ export class Game {
        * El paso 2 es clave: antes se cambiaban por cambiarse y acababan en
        * fila de a tres bloqueando la autopista. */
       const enCarril = Math.abs(c.x - laneCenter(c.lane)) < 0.05
-      const maxLane = c.truck ? 1 : LANES - 1   // los camiones no pisan el carril rápido
+      const maxLane = this.maxLaneFor(c)        // los camiones no pisan el carril rápido
 
       if (c.intent !== 0) {
         c.blinker = c.intent                    // sigue avisando mientras espera
@@ -461,32 +559,63 @@ export class Game {
           c.cooldown = c.intent < 0 ? 4 : 6.5
           c.intent = 0
         }
+      } else if (c.ovPhase !== 0) {
+        /* ============ MANIOBRA DE ADELANTAMIENTO EN CURSO =================
+         * Fase 1: ya está en el carril de la izquierda y acelera para rebasar.
+         * Fase 2: ha pasado con margen suficiente → se reincorpora delante.
+         * `ovT` es un tiempo máximo: si la maniobra se eterniza, se cancela y
+         * vuelve a la derecha (evita quedarse viviendo en el carril rápido). */
+        c.ovT -= dt
+        const presa = this.cars.find((x) => x.id === c.ovTarget) ?? null
+        const margen = c.length + 900 + c.speed * 0.45
+
+        if (c.ovPhase === 1) {
+          // empuje para rebasar de verdad, nunca quedarse en paralelo
+          target = Math.max(target, Math.min(c.desired * 1.12, (presa?.speed ?? c.desired) * 1.16))
+          if (!presa || c.z > presa.z + margen || c.ovT <= 0) {
+            c.ovPhase = 2
+            c.blinker = 1                          // avisa que se reincorpora
+          }
+        } else {
+          // fase 2: volver a la derecha en cuanto haya hueco real
+          const der = c.lane - 1
+          if (der >= 0 && this.laneFree(c.z, der, c.id)) {
+            c.intent = 1
+            c.intentT = 0.5 + Math.random() * 0.4
+            c.ovPhase = 0; c.ovTarget = 0
+          } else if (c.ovT <= -6) {
+            c.ovPhase = 0; c.ovTarget = 0; c.blinker = 0
+          }
+        }
       } else if (c.cooldown <= 0 && enCarril && c.yielding <= 0 && c.pullover <= 0) {
-        /* Umbrales SEGÚN PERSONALIDAD: el corredor se cambia por cualquier
-         * ganancia marginal y tolera huecos pequeños; el sinprisa casi nunca
-         * abandona la derecha; el conprisa adelanta solo si compensa. */
-        const esCorredor = c.kind === 'corredor' || esEmergencia(c.kind)
-        const umbralEstorbo = esCorredor ? 0.99 : c.kind === 'conprisa' ? 0.93 : 0.82
-        const umbralGanancia = esCorredor ? 1.02 : 1.08
-        const prisaVuelta = esCorredor ? 1.4 : c.kind === 'conprisa' ? 0.97 : 0.9
+        /* ============ ¿INICIAR UN ADELANTAMIENTO? =========================
+         * Umbrales según personalidad: el corredor se cambia por cualquier
+         * ganancia marginal y tolera huecos pequeños; el sinprisa y el camión
+         * casi nunca abandonan la derecha; el conprisa adelanta si compensa. */
+        const agresivo = c.kind === 'corredor' || esEmergencia(c.kind)
+        const umbralEstorbo = agresivo ? 0.99 : c.kind === 'conprisa' ? 0.94 : 0.85
+        const umbralGanancia = agresivo ? 1.02 : 1.07
+        const prisaVuelta = agresivo ? 1.4 : c.kind === 'conprisa' ? 0.97 : 0.9
 
         const ritmoActual = this.lanePace(c, c.lane)
         const izq = c.lane + 1, der = c.lane - 1
         const estorbado = ritmoActual < c.desired * umbralEstorbo
-        const casa = this.homeLane(c.kind, c.truck)
+        const casa = this.homeLane(c.kind, c.mood)
 
         if (estorbado && izq <= maxLane && this.laneFree(c.z, izq, c.id)
             && this.lanePace(c, izq) > ritmoActual * umbralGanancia) {
+          // engancha la maniobra completa: señaliza, sale, pasa y se reincorpora
+          const presa = this.leaderCar(c, c.lane)
           c.intent = -1
-          c.intentT = esCorredor ? 0.18 + Math.random() * 0.2 : 0.7 + Math.random() * 0.5
+          c.intentT = agresivo ? 0.18 + Math.random() * 0.2 : 0.6 + Math.random() * 0.45
+          if (presa) { c.ovTarget = presa.id; c.ovPhase = 1; c.ovT = 9 }
         } else if (der >= 0 && c.lane > casa && this.laneFree(c.z, der, c.id)
             && this.lanePace(c, der) >= c.desired * prisaVuelta) {
           // mantenerse a la derecha: vuelve a su carril natural
           c.intent = 1; c.intentT = 0.9 + Math.random() * 0.6
-        } else if (estorbado && esCorredor && c.lane === maxLane && Math.abs(c.x) < 1.0) {
+        } else if (estorbado && agresivo && c.lane === maxLane && Math.abs(c.x) < 1.0) {
           // temerario: si no hay carril libre, bordea el límite de la calzada
-          c.x += (c.evadeDir >= 0 ? -1 : 1) * 0.0
-          c.x -= 0.22 * dt                       // se arrima al borde izquierdo
+          c.x -= 0.22 * dt
         }
       }
 
@@ -525,16 +654,23 @@ export class Game {
         // reaparece delante (o detrás si es un coche rápido que nos alcanzará)
         const detras = Math.random() < 0.3
         const kind = this.rollKind()
-        const truck = kind === 'sinprisa' && Math.random() < 0.35
-        const lane = detras && !truck ? LANES - 1 : this.homeLane(kind, truck)
+        const truck = kind === 'camion'
+        const cargo = truck ? Math.random() : 0
+        const mood = kind === 'corredor' ? 0.6 + Math.random() * 0.4
+          : kind === 'sinprisa' ? Math.random() * 0.5
+          : Math.random()
+        const lane = detras && !truck ? LANES - 1 : this.homeLane(kind, mood)
         c.kind = kind
         c.truck = truck
+        c.cargo = cargo
+        c.mood = mood
+        c.moodT = 8 + Math.random() * 22
         c.lane = lane
         c.x = laneCenter(lane)
         c.z = detras ? this.z - 7000 - Math.random() * 4000 : this.z + DRAW * SEG * (0.75 + Math.random() * 0.35)
         c.length = truck ? 1500 : esEmergencia(kind) ? 760 : 620
         c.width = truck ? 480 : esEmergencia(kind) ? 420 : 380
-        c.desired = this.paceFor(kind, limitAt(Math.floor(c.z / SEG)), truck)
+        c.desired = this.paceFor(kind, limitAt(Math.floor(c.z / SEG)), mood, cargo)
         c.speed = c.desired
         c.color = kind === 'ambulancia' ? 7 : kind === 'patrulla' ? 8 : Math.floor(Math.random() * 7)
         c.siren = 0
@@ -551,6 +687,19 @@ export class Game {
         c.relax = 0
         c.evade = 0
         c.pressure = 0
+        c.ovPhase = 0
+        c.ovTarget = 0
+        c.ovT = 0
+        c.honk = 0
+        c.abreast = 0
+        c.makeWay = 0
+        /* ESCALONADO AL REAPARECER: si cae a la altura de otro coche en un
+         * carril contiguo, lo separamos medio largo. Evita que el tráfico
+         * nazca ya formando una barrera. */
+        for (const o of this.cars) {
+          if (o.id === c.id || Math.abs(o.lane - c.lane) > 1) continue
+          if (Math.abs(o.z - c.z) < 2200) { c.z += 2600 + Math.random() * 1800; break }
+        }
       }
     }
 
@@ -560,7 +709,8 @@ export class Game {
       const presa = this.cars.find((x) =>
         x.kind === 'corredor' && x.pullover <= 0 &&
         Math.abs(x.z - p.z) < 12000)
-      if (presa) { p.chasing = presa.id; p.desired = this.paceFor('ambulancia', limitAt(Math.floor(p.z / SEG)), false) }
+      // solo las patrullas con prisa salen a perseguir; las de ronda, no
+      if (presa && p.mood > 0.5) { p.chasing = presa.id; p.mood = 1 }
     }
 
     // densidad viva: de vez en cuando entra alguien nuevo si hay poco tráfico
@@ -740,6 +890,54 @@ export class Game {
     this.updateGear()
   }
 
+  /** Hueco libre por delante del jugador en cada carril (unidades de mundo). */
+  private laneGaps(): number[] {
+    const gaps = new Array<number>(LANES).fill(Infinity)
+    for (const c of this.cars) {
+      if (c.lane < 0 || c.lane >= LANES) continue
+      const d = c.z - this.pz
+      if (d > -600 && d < gaps[c.lane]) gaps[c.lane] = Math.max(0, d)
+    }
+    return gaps
+  }
+
+  /* ----------------- REGLA ANTI-PELOTÓN (prevención) ---------------------
+   * El 90 % de los bloqueos nacen de coches rodando EN PARALELO a la misma
+   * velocidad. En lugar de esperar al muro, los detectamos en cuanto se
+   * emparejan: si dos vehículos llevan más de ~2,5 s costado con costado, el
+   * que tiene menos prisa afloja un poco y el que tiene más aprieta, de modo
+   * que se escalonan solos. Es lo que hace el tráfico real sin pensarlo.
+   * --------------------------------------------------------------------- */
+  private unclump(dt: number) {
+    for (let i = 0; i < this.cars.length; i++) {
+      const a = this.cars[i]
+      if (a.pullover > 0 || esEmergencia(a.kind)) continue
+      for (let j = i + 1; j < this.cars.length; j++) {
+        const b = this.cars[j]
+        if (b.pullover > 0 || esEmergencia(b.kind)) continue
+        if (Math.abs(a.lane - b.lane) !== 1) continue
+        // ¿se solapan longitudinalmente? (van a la par)
+        if (Math.abs(a.z - b.z) > (a.length + b.length) * 0.75) continue
+        // ¿a ritmo casi idéntico? entonces nunca se separarán solos
+        if (Math.abs(a.speed - b.speed) > 220) continue
+
+        a.abreast += dt
+        b.abreast += dt
+        if (a.abreast > 2.5) {
+          // el de menos prisa cede el ritmo; el de más prisa aprieta
+          const lento = a.desired <= b.desired ? a : b
+          const rapido = lento === a ? b : a
+          lento.relax = Math.max(lento.relax, 1.6)
+          rapido.boost = Math.max(rapido.boost, 1.6)
+          a.abreast = 0
+          b.abreast = 0
+        }
+      }
+    }
+    // el contador decae si dejan de ir emparejados
+    for (const c of this.cars) c.abreast = Math.max(0, c.abreast - dt * 0.35)
+  }
+
   /* ------------------- VERIFICACIÓN DE HUECOS (anti-barrera) -------------
    * Problema clásico del tráfico simulado: tres coches a velocidad parecida
    * acaban en línea ocupando los tres carriles y forman un muro rodante que
@@ -750,12 +948,70 @@ export class Game {
    * de modo que se escalonan y se abre una diagonal por la que colarse.
    * --------------------------------------------------------------------- */
   private relieveBarrier(dt: number) {
+    this.unclump(dt)                      // prevención continua
+
+    /* ---- GARANTÍA DE CORREDOR (corrección con escalada) -----------------
+     * Regla de oro del juego: SIEMPRE debe existir un camino por delante.
+     * Medimos el hueco de cada carril cada frame; si el mejor no alcanza
+     * para pasar, sube `blockT`. Cuanto más tiempo lleve el jugador sin ruta,
+     * más enérgica es la intervención sobre el carril más prometedor:
+     *   >1,5 s  aviso suave: el tapón acelera un poco
+     *   >3,0 s  orden de despejar: cambia de carril señalizando
+     *   >5,0 s  prioridad total: se aparta sí o sí y los demás le abren
+     * Es invisible para el jugador: solo nota que el tráfico "se abre". */
+    const gaps = this.laneGaps()
+    const necesario = PLAYER_L + 1100 + this.speed * 1.0
+    let mejor = 0, mejorGap = -1
+    for (let l = 0; l < LANES; l++) if (gaps[l] > mejorGap) { mejorGap = gaps[l]; mejor = l }
+    this.blockedAll = mejorGap < necesario
+
+    if (this.blockedAll) {
+      this.blockT += dt
+      // el carril objetivo: el que más hueco tiene (el más fácil de abrir)
+      const tapon = this.cars.find((c) =>
+        c.lane === mejor && c.z - this.pz > -600 && c.z - this.pz <= mejorGap + 400)
+      if (tapon && this.blockT > 1.5) {
+        tapon.makeWay = Math.max(tapon.makeWay, 1.2)
+        tapon.boost = Math.max(tapon.boost, 1.2)
+        tapon.abreast = 0
+        if (this.blockT > 3) {
+          // que se quite: busca cualquier carril contiguo con sitio
+          const opciones = [tapon.lane - 1, tapon.lane + 1]
+            .filter((l) => l >= 0 && l <= this.maxLaneFor(tapon))
+          const destino = opciones.find((l) => this.laneFree(tapon.z, l, tapon.id))
+          if (destino !== undefined && tapon.intent === 0) {
+            tapon.intent = destino < tapon.lane ? 1 : -1
+            tapon.intentT = 0.25
+            tapon.ovPhase = 0
+          }
+        }
+        if (this.blockT > 5 && tapon.intent === 0) {
+          // última instancia: se desplaza aunque el carril no esté perfecto,
+          // y sus vecinos le hacen sitio (efecto cremallera)
+          const dir = tapon.lane > 0 ? -1 : 1
+          const destino = tapon.lane + dir
+          for (const o of this.cars) {
+            if (o.lane === destino && Math.abs(o.z - tapon.z) < 3500) {
+              o.relax = Math.max(o.relax, 1.5)
+              o.nudge += (dir > 0 ? 0.28 : -0.28) * dt
+            }
+          }
+          tapon.lane = Math.max(0, Math.min(this.maxLaneFor(tapon), destino))
+          tapon.blinker = dir > 0 ? -1 : 1
+          tapon.cooldown = 3
+          this.blockT = 2                 // damos margen a que la maniobra cuaje
+        }
+      }
+    } else {
+      this.blockT = Math.max(0, this.blockT - dt * 2)
+    }
+
     this.barrierT -= dt
     if (this.barrierT > 0) return
     this.barrierT = 1.2
 
     // hueco necesario: el coche + distancia de seguridad a la velocidad actual
-    const necesario = PLAYER_L + 900 + this.speed * 0.9
+    const necesarioTramo = PLAYER_L + 900 + this.speed * 0.9
     const ventana = 4200 + this.speed * 1.2
 
     let huecoMax = 0
@@ -776,10 +1032,9 @@ export class Game {
     }
 
     const cerrados = tapones.filter(Boolean).length
-    this.blockedAll = cerrados >= LANES
 
     // ¿hay por dónde pasar? entonces no tocamos nada: que el jugador maniobre
-    if (!this.blockedAll && huecoMax >= necesario) return
+    if (huecoMax >= necesarioTramo) return
     if (cerrados < LANES) return
 
     /* ---- MURO DETECTADO: desalojo ordenado por personalidad -------------
@@ -979,6 +1234,24 @@ export class EngineAudio {
       tsrc.connect(bp); bp.connect(tg); tg.connect(a.destination); tsrc.start()
       this.tireGain = tg
     } catch { /* sin audio disponible */ }
+  }
+
+  /** Bocina de ambulancia: dos tonos en quinta, como un claxon real. */
+  horn() {
+    const a = this.ctx
+    if (!a || this.muted) return
+    const t = a.currentTime
+    for (const f of [440, 660]) {
+      const o = a.createOscillator(); o.type = 'sawtooth'; o.frequency.value = f
+      const lp = a.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1800
+      const g = a.createGain()
+      g.gain.setValueAtTime(0.0001, t)
+      g.gain.exponentialRampToValueAtTime(0.05, t + 0.02)
+      g.gain.setValueAtTime(0.05, t + 0.42)
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 0.55)
+      o.connect(lp); lp.connect(g); g.connect(a.destination)
+      o.start(t); o.stop(t + 0.6)
+    }
   }
 
   /** Golpe seco del cambio de marcha (clunk de transmisión). */

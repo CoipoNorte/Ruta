@@ -58,7 +58,7 @@ export default function Drive() {
   const [hud, setHud] = useState({
     km: 0, vel: 0, gear: 1, time: 0, ovt: 0, flow: 1, rpm: 0, shift: 0,
     limit: 120, speeding: false, rain: 0, score: 100, blinker: 0 as -1 | 0 | 1,
-    blocked: false,
+    blocked: false, zona: '',
   })
 
   const lockRef = useRef(lock); lockRef.current = lock
@@ -118,6 +118,7 @@ export default function Drive() {
         audioRef.current.update(g.rpm, g.speedPct, throttle, g.lateralG, g.shake)
         // eventos de chasis → sonido y háptica
         if (g.gearChanged !== 0) audioRef.current.shift()
+        if (g.hornCue) { g.hornCue = 0; audioRef.current.horn() }   // bocina cercana
         if (g.shake > 0.5 && now - lastBuzz.current > 320) {
           lastBuzz.current = now
           navigator.vibrate?.(18)   // vibra solo al pisar la banquina
@@ -134,6 +135,7 @@ export default function Drive() {
           ovt: g.overtakes, flow: g.flow, rpm: g.rpm, shift: g.shiftFlash,
           limit: g.limit, speeding: g.speeding, rain: g.rain,
           score: Math.round(g.score), blinker: g.blinker, blocked: g.blockedAll,
+          zona: g.zona,
         })
       }
     }
@@ -178,9 +180,14 @@ export default function Drive() {
    * se ignoran aquí y quedan libres para los pedales (que están por encima
    * en z-index y reciben sus propios eventos).
    * ----------------------------------------------------------------------*/
-  /** Suelta el volante táctil y limpia TODO rastro del puntero. */
-  const soltarVolante = useCallback(() => {
-    if (!steerTouch.current) return
+  /** Suelta el volante. Si se indica `id`, SOLO libera cuando ese puntero es
+   *  justamente el que estaba dirigiendo — así el dedo de los pedales nunca
+   *  cancela la dirección (era la causa de que el volante se reiniciara al
+   *  acelerar con el otro pulgar). */
+  const soltarVolante = useCallback((id?: number) => {
+    const t = steerTouch.current
+    if (!t) return
+    if (id !== undefined && id !== t.id) return
     steerTouch.current = null
     pointerSteer.current = null
     setGrab((g) => (g.on ? { ...g, on: false } : g))
@@ -195,7 +202,19 @@ export default function Drive() {
     setGrab({ on: true, x: e.clientX, y: e.clientY })
   }
   const onWheelMove = (e: React.PointerEvent) => {
-    const t = steerTouch.current
+    let t = steerTouch.current
+    /* RE-ENGANCHE: si el sistema canceló el puntero del volante (gesto, aviso
+     * del SO…) pero el dedo sigue apoyado, lo recuperamos tomando la posición
+     * actual como nuevo centro. Así nunca hay que levantar y volver a pulsar.
+     * En ratón `buttons` es 0 sin botón pulsado, de modo que no se re-engancha
+     * por un simple movimiento del cursor. */
+    if (!t && e.buttons > 0 && faseRef.current === 'corriendo') {
+      t = { id: e.pointerId, x0: e.clientX }
+      steerTouch.current = t
+      pointerSteer.current = 0
+      setGrab({ on: true, x: e.clientX, y: e.clientY })
+      return
+    }
     if (!t || t.id !== e.pointerId) return
     // SEGURO ANTI-ATASCO: con ratón, si ya no hay botón pulsado es que se
     // perdió el `pointerup` (se soltó fuera de la ventana). Antes esto dejaba
@@ -204,9 +223,7 @@ export default function Drive() {
     pointerSteer.current = steerCurve((e.clientX - t.x0) / dragRef.current)
   }
   const onWheelUp = (e: React.PointerEvent) => {
-    const t = steerTouch.current
-    if (!t || t.id !== e.pointerId) return
-    soltarVolante()                 // el motor lo devuelve al centro solo
+    soltarVolante(e.pointerId)      // el motor lo devuelve al centro solo
   }
 
   /* Pedales. Mantener pulsado en móvil dispara el menú contextual del sistema
@@ -289,18 +306,21 @@ export default function Drive() {
     }
   }, [])
 
-  /* Red de seguridad global del puntero: si el `pointerup` se pierde (soltar
-   * fuera de la ventana, cambio de pestaña, gesto del sistema), liberamos el
-   * volante igualmente para que no quede "pegado". */
+  /* Red de seguridad global del puntero: si el `pointerup` del volante se
+   * pierde (soltar fuera de la ventana, gesto del sistema), lo liberamos para
+   * que no quede "pegado".
+   * CLAVE MULTITÁCTIL: se compara el `pointerId`. Antes liberaba con CUALQUIER
+   * dedo, así que levantar el pulgar del acelerador reiniciaba la dirección. */
   useEffect(() => {
-    const libera = () => soltarVolante()
+    const libera = (e: PointerEvent) => soltarVolante(e.pointerId)
+    const liberaTodo = () => soltarVolante()
     window.addEventListener('pointerup', libera)
     window.addEventListener('pointercancel', libera)
-    window.addEventListener('blur', libera)
+    window.addEventListener('blur', liberaTodo)
     return () => {
       window.removeEventListener('pointerup', libera)
       window.removeEventListener('pointercancel', libera)
-      window.removeEventListener('blur', libera)
+      window.removeEventListener('blur', liberaTodo)
     }
   }, [soltarVolante])
 
@@ -340,7 +360,7 @@ export default function Drive() {
           {/* odómetro */}
           <div className="rounded-lg border border-white/[0.07] bg-black/25 px-2.5 py-1.5 backdrop-blur-sm">
             <p className="flex items-center gap-1 font-mono text-[8px] uppercase tracking-[0.2em] text-white/40">
-              <Milestone className="size-2.5" /> recorrido
+              <Milestone className="size-2.5" /> {hud.zona || 'recorrido'}
             </p>
             <p className="font-mono text-xl font-semibold leading-none tabular-nums">
               {hud.km.toFixed(2)}<span className="ml-1 text-[10px] text-white/50">km</span>
@@ -353,7 +373,7 @@ export default function Drive() {
               <p className="font-mono text-xs font-semibold tabular-nums">{fmtTime(hud.time)}</p>
             </div>
             <div className="rounded-lg border border-white/[0.07] bg-black/25 px-2 py-1.5 text-center backdrop-blur-sm">
-              <p className="font-mono text-[8px] uppercase tracking-[0.16em] text-white/40">adelant.</p>
+            <p className="font-mono text-[8px] uppercase tracking-[0.16em] text-white/40">adelant.</p>
               <p className="font-mono text-xs font-semibold tabular-nums">{hud.ovt}</p>
             </div>
             <button

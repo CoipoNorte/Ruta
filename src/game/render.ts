@@ -27,6 +27,56 @@ const P_NOCHE: Pal    = { skyTop: '#060A18', skyBot: '#131E38', sun: '#DCE6F5', 
 /* Ciclo diario con fases de DURACIÓN DESIGUAL (antes los 4 estados duraban lo
  * mismo y la noche se hacía eterna). Ahora: día largo, crepúsculos breves e
  * intensos y noche contenida. `t` es la fracción del ciclo. */
+/* ============================== BIOMAS ====================================
+ * La idea: recorrer un país largo y estrecho, del desierto a la Antártida,
+ * por la misma carretera. Cada bioma tiñe la paleta (césped, colinas, cielo,
+ * niebla) y define QUÉ crece al borde del camino. Se mezclan entre sí con
+ * suavizado, de modo que el paisaje se transforma sin cortes.
+ * ========================================================================= */
+type Deco = 'cactus' | 'pino' | 'arbol' | 'roca' | 'nieve' | 'estepa' | 'urbano'
+
+interface Biome {
+  nombre: string
+  grass: string      // color del terreno
+  hillFar: string
+  hillNear: string
+  skyTint: string    // tinte que recibe el cielo
+  skyMix: number
+  fog: string
+  deco: Deco
+  densidad: number   // 0..1 cuánta vegetación/mobiliario aparece
+  nieve: number      // 0..1 manto blanco al borde de la calzada
+}
+
+const BIOMAS: Biome[] = [
+  { nombre: 'Desierto',  grass: '#B08A52', hillFar: '#9C7B52', hillNear: '#8A6A43', skyTint: '#F2C98A', skyMix: 0.22, fog: '#D9B98A', deco: 'cactus', densidad: 0.35, nieve: 0 },
+  { nombre: 'Valle',     grass: '#7E9A4E', hillFar: '#7E8B6A', hillNear: '#5F7A47', skyTint: '#CFE3F2', skyMix: 0.1,  fog: '#BFCBB4', deco: 'arbol',  densidad: 0.7,  nieve: 0 },
+  { nombre: 'Ciudad',    grass: '#6E6E68', hillFar: '#5E6470', hillNear: '#4A4F58', skyTint: '#C6CEDA', skyMix: 0.16, fog: '#A9B2BE', deco: 'urbano', densidad: 1,    nieve: 0 },
+  { nombre: 'Bosque',    grass: '#3F6B43', hillFar: '#39563F', hillNear: '#2C4433', skyTint: '#A9C7CE', skyMix: 0.12, fog: '#8FA894', deco: 'pino',   densidad: 1,    nieve: 0 },
+  { nombre: 'Sierra',    grass: '#6C6A58', hillFar: '#6A6E62', hillNear: '#4C4A42', skyTint: '#BCC8D6', skyMix: 0.14, fog: '#A6AEB8', deco: 'roca',   densidad: 0.5,  nieve: 0.12 },
+  { nombre: 'Cordillera',grass: '#8E9AA4', hillFar: '#AEBAC6', hillNear: '#7B8894', skyTint: '#D6E4F0', skyMix: 0.2,  fog: '#C4D2DE', deco: 'nieve',  densidad: 0.7,  nieve: 0.75 },
+  { nombre: 'Patagonia', grass: '#8A8F6E', hillFar: '#78806E', hillNear: '#5C6354', skyTint: '#C2D4DE', skyMix: 0.15, fog: '#B0BCBE', deco: 'estepa', densidad: 0.45, nieve: 0.1 },
+  { nombre: 'Austral',   grass: '#DCE6EE', hillFar: '#C6D6E4', hillNear: '#A8BCCE', skyTint: '#E2EEF8', skyMix: 0.3,  fog: '#D8E6F0', deco: 'nieve',  densidad: 0.3,  nieve: 1 },
+]
+
+const BIOMA_KM = 7.5    // longitud de cada tramo de paisaje
+
+/** Bioma en un kilómetro dado: dos vecinos y su factor de mezcla. */
+export function biomeAt(km: number) {
+  const f = km / BIOMA_KM
+  const i = Math.floor(f)
+  const t = f - i
+  // orden pseudoaleatorio pero continuo: nunca repite el mismo dos veces
+  const idx = (n: number) => {
+    const h = hash(n * 2.137 + 11.3)
+    return BIOMAS[Math.floor(h * BIOMAS.length) % BIOMAS.length]
+  }
+  const a = idx(i), b = idx(i + 1)
+  // transición solo en el último 30 % del tramo
+  const k = t < 0.7 ? 0 : 0.5 - 0.5 * Math.cos(((t - 0.7) / 0.3) * Math.PI)
+  return { a, b, k, nombre: k < 0.5 ? a.nombre : b.nombre }
+}
+
 const CICLO_KM = 34
 const FASES: { t: number; pal: Pal }[] = [
   { t: 0.00, pal: P_NOCHE },
@@ -342,6 +392,32 @@ function drawCar(
 /* ================================ RENDER ================================== */
 export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: number) {
   const pal = palette(g.km)
+
+  /* ---- BIOMA: tiñe el paisaje sobre el ciclo diario ---------------------
+   * Primero el bioma (qué terreno es) y luego la lluvia; así un bosque de
+   * noche bajo la lluvia combina las tres capas de forma coherente. */
+  const bio = biomeAt(g.km)
+  g.zona = bio.nombre                 // el HUD lo muestra como "paisaje"
+  const bioMix = (campo: keyof Biome) => mix(bio.a[campo] as string, bio.b[campo] as string, bio.k)
+  const bioNum = (campo: 'densidad' | 'nieve') => bio.a[campo] + (bio.b[campo] - bio.a[campo]) * bio.k
+  const terreno = bioMix('grass')
+  const nieve = bioNum('nieve')
+  pal.grass1 = mix(pal.grass1, terreno, 0.88)
+  pal.grass2 = mix(pal.grass2, shade(terreno, -0.1), 0.88)
+  pal.hillFar = mix(pal.hillFar, bioMix('hillFar'), 0.8)
+  pal.hillNear = mix(pal.hillNear, bioMix('hillNear'), 0.8)
+  pal.fog = mix(pal.fog, bioMix('fog'), 0.65)
+  // el cielo solo se tiñe de día (de noche manda la oscuridad)
+  const cieloMix = (bio.a.skyMix + (bio.b.skyMix - bio.a.skyMix) * bio.k) * (1 - pal.dark)
+  pal.skyBot = mix(pal.skyBot, bioMix('skyTint'), cieloMix)
+  pal.skyTop = mix(pal.skyTop, bioMix('skyTint'), cieloMix * 0.45)
+  if (nieve > 0.05) {
+    // manto blanco: aclara el terreno y los arcenes
+    pal.grass1 = mix(pal.grass1, '#E8F0F6', nieve * 0.8)
+    pal.grass2 = mix(pal.grass2, '#DCE6EE', nieve * 0.8)
+    pal.rumble2 = mix(pal.rumble2, '#FFFFFF', nieve * 0.5)
+  }
+
   /* Lluvia: oscurece cielo y asfalto, apaga el césped y cierra la visibilidad.
    * Se aplica sobre la paleta del ciclo diario para que ambos se combinen. */
   if (g.rain > 0.02) {
@@ -523,7 +599,8 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     const h1 = hash(i)
     const esKm = i % 333 === 0
     const esLimite = i % 900 === 0
-    if (!esKm && !esLimite && h1 > 0.085) continue
+    // la densidad depende del bioma: un bosque está poblado, el desierto no
+    if (!esKm && !esLimite && h1 > 0.085 * (0.35 + bioNum('densidad') * 1.3)) continue
     const lado = esKm || esLimite ? 1 : hash(i + 7) < 0.5 ? -1 : 1
     const off = (1.35 + hash(i + 3) * 0.9) * lado
     const s = scaleOf(i * SEG)
@@ -563,14 +640,88 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
           ctx.fillText(String(Math.round((i * SEG) / 100000)), sx, sy - h * 2.58)
         } else {
           const tipo = hash(i * 3.1)
-          if (tipo < 0.5) {
-            // árbol
+          if (tipo < 0.62) {
+            /* --- VEGETACIÓN / MOBILIARIO SEGÚN EL BIOMA --- */
             const h = (900 + hash(i * 5) * 700) * sc
             if (h < 1) return
-            ctx.fillStyle = `rgba(40,30,22,${0.9 - pal.dark * 0.3})`
-            ctx.fillRect(sx - h * 0.045, sy - h * 0.34, h * 0.09, h * 0.34)
-            ctx.fillStyle = mix(pal.hillNear, pal.grass1, 0.5)
-            ctx.beginPath(); ctx.ellipse(sx, sy - h * 0.55, h * 0.26, h * 0.3, 0, 0, Math.PI * 2); ctx.fill()
+            const deco = hash(i * 1.9) < bio.k ? bio.b.deco : bio.a.deco
+            const tronco = `rgba(42,32,24,${0.9 - pal.dark * 0.3})`
+            const follaje = mix(pal.hillNear, pal.grass1, 0.45)
+            switch (deco) {
+              case 'pino': {          // conífera: copa triangular en dos pisos
+                ctx.fillStyle = tronco
+                ctx.fillRect(sx - h * 0.035, sy - h * 0.3, h * 0.07, h * 0.3)
+                ctx.fillStyle = nieve > 0.4 ? mix(follaje, '#E8F0F6', 0.45) : follaje
+                for (const [cy, w2, hh] of [[0.3, 0.3, 0.42], [0.58, 0.22, 0.34]] as const) {
+                  ctx.beginPath()
+                  ctx.moveTo(sx, sy - h * (cy + hh))
+                  ctx.lineTo(sx + h * w2, sy - h * cy)
+                  ctx.lineTo(sx - h * w2, sy - h * cy)
+                  ctx.closePath(); ctx.fill()
+                }
+                break
+              }
+              case 'cactus': {        // columnar con dos brazos
+                const cc = mix('#4E7A46', pal.grass1, 0.3)
+                ctx.fillStyle = cc
+                rr(ctx, sx - h * 0.06, sy - h * 0.62, h * 0.12, h * 0.62, h * 0.05); ctx.fill()
+                rr(ctx, sx - h * 0.2, sy - h * 0.46, h * 0.08, h * 0.26, h * 0.04); ctx.fill()
+                rr(ctx, sx + h * 0.12, sy - h * 0.52, h * 0.08, h * 0.3, h * 0.04); ctx.fill()
+                break
+              }
+              case 'urbano': {        // edificio con ventanas iluminadas
+                const bh = h * (0.9 + hash(i * 7.3) * 1.5)
+                const bw = h * (0.36 + hash(i * 4.1) * 0.3)
+                ctx.fillStyle = mix('#3E434C', pal.fog, 0.25)
+                ctx.fillRect(sx - bw / 2, sy - bh, bw, bh)
+                if (bw > 6) {
+                  const cols = Math.max(2, Math.floor(bw / (h * 0.11)))
+                  const filas = Math.max(2, Math.floor(bh / (h * 0.17)))
+                  for (let a2 = 0; a2 < cols; a2++) for (let b2 = 0; b2 < filas; b2++) {
+                    const on = hash(i * 13 + a2 * 3.1 + b2 * 7.7) < 0.35 + pal.dark * 0.4
+                    ctx.fillStyle = on
+                      ? `rgba(255,214,140,${0.25 + pal.dark * 0.55})`
+                      : 'rgba(20,24,30,0.4)'
+                    ctx.fillRect(sx - bw / 2 + bw * (0.16 + a2 * 0.84 / cols), sy - bh + bh * (0.1 + b2 * 0.84 / filas), bw * 0.42 / cols, bh * 0.4 / filas)
+                  }
+                }
+                break
+              }
+              case 'roca': {          // peñasco de dos caras
+                const rh = h * 0.42
+                ctx.fillStyle = mix('#7A7468', pal.hillNear, 0.35)
+                ctx.beginPath()
+                ctx.moveTo(sx - rh * 0.6, sy); ctx.lineTo(sx - rh * 0.15, sy - rh)
+                ctx.lineTo(sx + rh * 0.3, sy - rh * 0.75); ctx.lineTo(sx + rh * 0.66, sy)
+                ctx.closePath(); ctx.fill()
+                ctx.fillStyle = 'rgba(255,255,255,0.12)'
+                ctx.beginPath()
+                ctx.moveTo(sx - rh * 0.15, sy - rh); ctx.lineTo(sx + rh * 0.3, sy - rh * 0.75)
+                ctx.lineTo(sx + rh * 0.1, sy - rh * 0.3); ctx.closePath(); ctx.fill()
+                break
+              }
+              case 'estepa': {        // matorral bajo de la pampa
+                ctx.fillStyle = mix('#8A8A62', pal.grass2, 0.4)
+                ctx.beginPath(); ctx.ellipse(sx, sy - h * 0.1, h * 0.2, h * 0.11, 0, 0, Math.PI * 2); ctx.fill()
+                ctx.beginPath(); ctx.ellipse(sx + h * 0.16, sy - h * 0.06, h * 0.12, h * 0.07, 0, 0, Math.PI * 2); ctx.fill()
+                break
+              }
+              case 'nieve': {         // conífera nevada / montículo helado
+                ctx.fillStyle = tronco
+                ctx.fillRect(sx - h * 0.03, sy - h * 0.24, h * 0.06, h * 0.24)
+                ctx.fillStyle = mix('#7E9A94', '#F2F8FC', 0.55)
+                ctx.beginPath()
+                ctx.moveTo(sx, sy - h * 0.72); ctx.lineTo(sx + h * 0.24, sy - h * 0.22)
+                ctx.lineTo(sx - h * 0.24, sy - h * 0.22); ctx.closePath(); ctx.fill()
+                break
+              }
+              default: {              // árbol de hoja ancha
+                ctx.fillStyle = tronco
+                ctx.fillRect(sx - h * 0.045, sy - h * 0.34, h * 0.09, h * 0.34)
+                ctx.fillStyle = follaje
+                ctx.beginPath(); ctx.ellipse(sx, sy - h * 0.55, h * 0.26, h * 0.3, 0, 0, Math.PI * 2); ctx.fill()
+              }
+            }
           } else {
             // farola
             const h = 1500 * sc
@@ -612,6 +763,22 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
       n, z: c.z,
       draw: () => {
         drawCar(ctx, sx, sy, sw, CAR_COLORS[c.color], pal.dark, c.truck, frena, c.blinker, g.time)
+        // camión: la carga se ve como un bulto sobre la caja
+        if (c.truck && c.cargo > 0.35 && sw > 14) {
+          const ch = sw * 1.3
+          ctx.fillStyle = `rgba(90,74,54,${0.5 + c.cargo * 0.35})`
+          ctx.fillRect(sx - sw * 0.4, sy - ch * (0.9 + c.cargo * 0.12), sw * 0.8, ch * 0.08)
+        }
+        // bocina: ondas sobre el techo
+        if (c.honk > 0 && sw > 10 && Math.floor(g.time * 9) % 2 === 0) {
+          ctx.strokeStyle = 'rgba(255,220,120,0.75)'
+          ctx.lineWidth = Math.max(1, sw * 0.03)
+          for (const r of [0.45, 0.72]) {
+            ctx.beginPath()
+            ctx.arc(sx, sy - sw * 1.0, sw * r, Math.PI * 1.18, Math.PI * 1.82)
+            ctx.stroke()
+          }
+        }
         if (emerg) {
           const ch = sw * 0.8
           // franjas de identificación en el costado
@@ -748,7 +915,9 @@ function drawMirror(ctx: CanvasRenderingContext2D, g: Game, W: number, H: number
   const mw = Math.min(W * 0.58, 290)
   const mh = Math.max(44, Math.min(H * 0.072, 62))
   const mx = (W - mw) / 2
-  const my = H * 0.105
+  /* Queda POR DEBAJO del HUD superior (odómetro + barra de conducción), que
+   * ocupa unos 86 px. En pantallas altas baja proporcionalmente. */
+  const my = Math.max(H * 0.135, 94)
 
   ctx.save()
   // marco y cristal
