@@ -72,10 +72,52 @@ export function limitAt(i: number): number {
   return h < 0.1 ? 60 : h < 0.28 ? 80 : h < 0.52 ? 100 : h < 0.85 ? 120 : 130
 }
 
-/** Meteorología: 0 seco … 1 lluvia fuerte. Función del kilometraje. */
-export function weatherAt(km: number): number {
+/* ============================== METEOROLOGÍA ==============================
+ * El clima no es aleatorio: DEPENDE DEL PAISAJE. Nieva en la cordillera,
+ * hay polvo en suspensión en el desierto, bruma en el bosque y la Patagonia,
+ * y lluvia en el valle. Cada fenómeno afecta de forma distinta a la
+ * conducción (agarre, frenada, visibilidad).
+ * ========================================================================= */
+export type WeatherKind = 'seco' | 'lluvia' | 'nieve' | 'niebla' | 'tierra'
+
+export const BIOMA_KM = 7.5     // longitud de cada tramo de paisaje
+export const BIOME_COUNT = 8
+
+/** Índice de bioma (0..7) y mezcla con el siguiente tramo. Fuente única:
+ *  el render pinta exactamente el bioma que aquí decide el clima. */
+export function biomeMix(km: number) {
+  const f = km / BIOMA_KM
+  const i = Math.floor(f)
+  const t = f - i
+  const pick = (n: number) => Math.floor(hash(n * 2.137 + 11.3) * BIOME_COUNT) % BIOME_COUNT
+  const k = t < 0.7 ? 0 : 0.5 - 0.5 * Math.cos(((t - 0.7) / 0.3) * Math.PI)
+  return { a: pick(i), b: pick(i + 1), k }
+}
+
+/** Fenómeno dominante de cada bioma (mismo orden que `BIOMAS` en render). */
+const CLIMA_BIOMA: WeatherKind[] = [
+  'tierra',   // 0 Desierto   — polvo en suspensión
+  'lluvia',   // 1 Valle
+  'niebla',   // 2 Ciudad     — smog
+  'niebla',   // 3 Bosque     — bruma entre los árboles
+  'lluvia',   // 4 Sierra
+  'nieve',    // 5 Cordillera
+  'niebla',   // 6 Patagonia  — viento y bruma
+  'nieve',    // 7 Austral
+]
+
+/** Frente meteorológico en un kilómetro dado: tipo e intensidad 0..1. */
+export function weatherAt(km: number): { kind: WeatherKind; power: number } {
+  const { a, b, k } = biomeMix(km)
+  const idx = k < 0.5 ? a : b
+  // los frentes van y vienen: no siempre hay fenómeno activo
   const w = Math.sin(km * 0.23 + 1.3) * 0.62 + Math.sin(km * 0.071) * 0.5
-  return clamp01((w - 0.34) * 2.1)
+  const power = clamp01((w - 0.3) * 2.0)
+  return { kind: power < 0.05 ? 'seco' : CLIMA_BIOMA[idx], power }
+}
+
+export const WEATHER_LABEL: Record<WeatherKind, string> = {
+  seco: 'despejado', lluvia: 'lluvia', nieve: 'nieve', niebla: 'niebla', tierra: 'polvo',
 }
 
 /* --------------------------- CARRETERA PROCEDURAL ------------------------- */
@@ -199,8 +241,26 @@ export class Game {
   gearChanged = 0       // 1 subida · -1 reducción · 0 nada (se consume por frame)
 
   /* ---- CONDUCCIÓN RESPONSABLE (capa de simulador) ---- */
-  rain = 0              // 0..1 intensidad de lluvia (suavizada)
-  grip = 1              // adherencia: baja con la lluvia
+  /* Canales de clima independientes y suavizados: permiten mezclar el final
+   * de un frente con el principio del siguiente sin saltos. */
+  weather: WeatherKind = 'seco'
+  rain = 0              // lluvia   → agarre −30 %, visibilidad −25 %
+  snow = 0              // nieve    → agarre −50 %, visibilidad −40 %
+  dust = 0              // polvo    → agarre −18 %, visibilidad −45 %
+  mist = 0              // niebla   → no afecta al agarre, visibilidad −75 %
+  wx = 0                // intensidad del fenómeno activo
+  visibility = 1        // 1 despejado … 0 ciego
+  revLimit = 0          // 0..1 tocando el limitador del motor
+  grip = 1              // adherencia combinada
+
+  /* ---- FÍSICA DEL FIRME (simulación) ----
+   * El agarre no es un número único: un neumático tiene un círculo de
+   * fricción que se reparte entre FRENAR y GIRAR. Con el firme deslizante
+   * cada eje se degrada de forma distinta, y aparecen fenómenos propios. */
+  slide = 0             // 0..1 el coche está perdiendo adherencia AHORA
+  understeer = 0        // 0..1 subviraje: giras y el coche sigue recto
+  crossWind = 0         // viento lateral (desierto/patagonia) en u/s
+  aquaplane = 0         // 0..1 aquaplaning sobre lámina de agua
   limit = 120           // límite legal del tramo actual (km/h)
   speeding = false      // circulando por encima del límite + margen
   blinker: -1 | 0 | 1 = 0   // intermitente del jugador (-1 izq · 1 der)
@@ -338,6 +398,21 @@ export class Game {
     if (kind === 'conprisa') return franja(0.28 + mood * 0.3)
     if (kind === 'patrulla') return franja(mood > 0.62 ? 0.5 : 0.15)
     return top                                        // corredores y ambulancias
+  }
+
+  /* ---- ADAPTACIÓN DE LA IA AL CLIMA ------------------------------------
+   * Un conductor normal levanta el pie con nieve o niebla. Pero no todos
+   * reaccionan igual: el corredor apenas se inmuta (excepción deliberada,
+   * es el que acaba teniendo sustos), la emergencia tiene que llegar, y el
+   * camión cargado es el más prudente de todos. */
+  private weatherPace(c: TrafficCar): number {
+    const malo = this.rain * 0.18 + this.snow * 0.45 + this.mist * 0.3 + this.dust * 0.12
+    const cautela = c.kind === 'corredor' ? 0.3
+      : esEmergencia(c.kind) ? 0.55
+      : c.kind === 'camion' ? 1.2 + c.cargo * 0.3
+      : c.kind === 'sinprisa' ? 1.15
+      : 1
+    return Math.max(0.42, 1 - malo * cautela)
   }
 
   /** Carril máximo permitido: los camiones nunca pisan los carriles rápidos. */
@@ -484,8 +559,11 @@ export class Game {
           else if (c.kind === 'conprisa' && c.mood < 0.12) c.kind = 'sinprisa'
         }
       }
-      // el ritmo se reevalúa continuamente contra el límite del tramo actual
+      /* el ritmo se reevalúa continuamente: límite del tramo × humor × clima.
+       * Con nieve o niebla el tráfico entero se compacta y rueda más lento,
+       * igual que en una carretera real. */
       c.desired = this.paceFor(c.kind, limitAt(Math.floor(c.z / SEG)), c.mood, c.cargo)
+        * this.weatherPace(c)
 
       /* --- ¿EL JUGADOR PIDE PASO? ----------------------------------------
        * Si lo llevamos pegado detrás, en su mismo carril y yendo nosotros más
@@ -810,20 +888,67 @@ export class Game {
     this.steer += (objetivo - this.steer) * Math.min(1, k * dt)
     if (!input.steering && Math.abs(this.steer) < 0.004) this.steer = 0
 
-    /* --- meteorología y adherencia (la lluvia alarga frenadas) --- */
-    const objLluvia = weatherAt(this.km)
-    this.rain += (objLluvia - this.rain) * Math.min(1, dt * 0.35)
-    this.grip = 1 - this.rain * 0.3
+    /* ---- METEOROLOGÍA: cada fenómeno afecta de una forma distinta -------
+     * lluvia → frenadas largas · nieve → poquísimo agarre · polvo → agarre
+     * algo menor y aire turbio · niebla → no toca el agarre pero ciega. */
+    const w = weatherAt(this.km)
+    this.weather = w.kind
+    const obj = (k: WeatherKind) => (w.kind === k ? w.power : 0)
+    const suave = (cur: number, o: number) => cur + (o - cur) * Math.min(1, dt * 0.35)
+    this.rain = suave(this.rain, obj('lluvia'))
+    this.snow = suave(this.snow, obj('nieve'))
+    this.dust = suave(this.dust, obj('tierra'))
+    this.mist = suave(this.mist, obj('niebla'))
+    this.wx = Math.max(this.rain, this.snow, this.dust, this.mist)
+    this.grip = Math.max(0.58, 1 - (this.rain * 0.22 + this.snow * 0.36 + this.dust * 0.12))
+    this.visibility = Math.max(0.18,
+      1 - (this.mist * 0.75 + this.snow * 0.4 + this.dust * 0.45 + this.rain * 0.25))
 
-    /* --- caja automática: solo acelerar y frenar --- */
+    /* AQUAPLANING: la lámina de agua levanta las ruedas del asfalto a partir
+     * de cierta velocidad. Por debajo de ~110 km/h no ocurre; por encima
+     * crece rápido y el coche deja de responder al volante. */
+    const vKmh = kmh(this.speed)
+    this.aquaplane = this.rain > 0.5
+      ? clamp01((vKmh - 140) / 70) * clamp01((this.rain - 0.5) / 0.4) * 0.7
+      : 0
+
+    /* VIENTO LATERAL: racha lenta que empuja el coche de costado. Amplitud
+     * moderada — se corrige con un toque de volante, no te saca del carril. */
+    const rachaObj = (this.dust * 0.22 + this.mist * 0.05)
+      * Math.sin(this.time * 0.37) * Math.sin(this.time * 0.11 + 1.3)
+    this.crossWind += (rachaObj - this.crossWind) * Math.min(1, dt * 0.8)
+
+    /* ---- FRENADA Y TRACCIÓN SOBRE FIRME DESLIZANTE ----------------------
+     * Frenar: la distancia se alarga de verdad. Con nieve el freno entrega
+     * poco más de la mitad, y sobre lámina de agua (aquaplaning) las ruedas
+     * casi no muerden. Además el ABS "pulsa" cuando pides más de lo que el
+     * neumático puede dar: se nota en el pedal como una vibración.
+     * Acelerar: patinan las ruedas motrices, así que la salida es lenta. */
+    const firme = this.grip * (1 - this.aquaplane * 0.45)
     if (input.brake) {
-      this.speed -= BRAKE * this.grip * dt
+      this.speed -= BRAKE * firme * dt
+      if (firme < 0.8 && this.speed > 500) {
+        this.slide = Math.min(1, this.slide + dt * 1.8)
+        // pulso del ABS: micro-vibración discreta al límite de adherencia
+        this.shake = Math.min(0.32, this.shake + (1 - firme) * dt * 1.1)
+      }
     } else if (input.throttle) {
-      // la aceleración cae con la velocidad (resistencia aerodinámica)
-      this.speed += ACCEL * (1 - 0.62 * this.speedPct) * (0.85 + 0.15 * this.grip) * dt
+      // patinaje de salida: a baja velocidad el firme malo roba algo de tracción
+      const patina = 1 - (1 - firme) * (1 - Math.min(1, this.speedPct * 2.5)) * 0.45
+      this.speed += ACCEL * (1 - 0.62 * this.speedPct) * (0.82 + 0.18 * firme) * patina * dt
+      if (firme < 0.72 && this.speedPct < 0.22) this.slide = Math.min(1, this.slide + dt * 1.1)
     } else {
       this.speed -= DRAG * dt
     }
+    this.slide = Math.max(0, this.slide - dt * 1.4)
+
+    /* ---- LIMITADOR DEL MOTOR -------------------------------------------
+     * Solo señaliza que el coche llegó a su techo (lo lee la barra de
+     * revoluciones del HUD). Sin temblor ni cortes bruscos: la velocidad ya
+     * se estanca sola por la resistencia aerodinámica. */
+    this.revLimit = input.throttle && this.speedPct > 0.96
+      ? Math.min(1, this.revLimit + dt * 6)
+      : Math.max(0, this.revLimit - dt * 3)
 
     /* --- banquina: se puede pisar, pero frena y vibra (sin castigo real) --- */
     const fuera = Math.abs(this.x) > 1
@@ -844,10 +969,34 @@ export class Game {
      * parado girando el volante — impropio de un simulador. */
     const pct = this.speedPct
     const rodando = Math.min(1, this.speed / 1200)      // 0 parado · 1 ≳43 km/h
-    this.x += this.steer * STEER_RATE * (0.45 + 0.55 * Math.min(1, pct * 2.4)) * rodando * dt
+
+    /* ---- SUBVIRAJE: el tren delantero deja de morder -------------------
+     * Con firme deslizante, cuanto MÁS volante pides, menos te hace caso el
+     * coche. Es la sensación clásica de la nieve: giras y sigues recto.
+     * Sobre lámina de agua la dirección se queda casi sin efecto. */
+    const exigencia = Math.abs(this.steer) * (0.35 + 0.65 * pct)
+    const objUnder = clamp01((1 - firme) * 0.85 * exigencia + this.aquaplane * 0.5)
+    this.understeer += (objUnder - this.understeer) * Math.min(1, dt * 3.5)
+    /* La autoridad nunca baja del 62 %: se nota que el coche va "flojo" y
+     * hay que anticipar, pero SIEMPRE se puede cambiar de carril. Un
+     * simulador se siente exigente, no bloqueado. */
+    const autoridad = 1 - this.understeer * 0.38
+
+    this.x += this.steer * STEER_RATE * (0.45 + 0.55 * Math.min(1, pct * 2.4))
+      * rodando * autoridad * dt
+
+    /* ---- VIENTO LATERAL: hay que corregir constantemente --------------- */
+    if (this.crossWind !== 0) this.x += this.crossWind * (0.25 + pct * 0.75) * dt
+
+    // al perder adherencia el coche se descoloca un poco: obliga a corregir,
+    // pero con una amplitud contenida para que no sea errático
+    if (this.understeer > 0.4 && pct > 0.35) {
+      this.slide = Math.max(this.slide, this.understeer * 0.6)
+      this.wobble += (Math.random() - 0.5) * this.understeer * 0.4 * dt
+    }
     /* --- fuerza centrífuga: hay que apoyar el volante en las curvas ---
      *     con asfalto mojado empuja más hacia fuera (menos agarre) --- */
-    this.x -= this.curve * pct * pct * CENTRIFUGAL * (2 - this.grip) * dt
+    this.x -= this.curve * pct * pct * CENTRIFUGAL * (1 + (1 - this.grip) * 0.6) * dt
     /* descontrol residual del roce: empuja el coche y se amortigua solo.
      * También depende de que el coche esté rodando (si está parado no derrapa). */
     if (this.wobble !== 0) {
@@ -958,8 +1107,8 @@ export class Game {
     }
 
     /* --- ritmo: premia ir suave y lejos de la banquina --- */
-    const suave = !input.brake && !fuera && this.courtesy === 0 ? 1 : 0
-    this.flow += ((suave ? 1 : 0.25) - this.flow) * Math.min(1, dt * 0.6)
+    const conduceSuave = !input.brake && !fuera && this.courtesy === 0
+    this.flow += ((conduceSuave ? 1 : 0.25) - this.flow) * Math.min(1, dt * 0.6)
 
     /* el ancho de calzada se interpola: la vía "se abre" al incorporarse */
     if (Math.abs(ROAD_W - this.roadWTarget) > 1) {
@@ -1362,7 +1511,10 @@ export class EngineAudio {
   }
 
   /** Llamar cada frame: la marcha hace que el tono "reinicie" al cambiar. */
-  update(rpm: number, speedPct: number, throttle: boolean, lateralG = 0, offroad = 0) {
+  update(
+    rpm: number, speedPct: number, throttle: boolean,
+    lateralG = 0, offroad = 0, revLimit = 0, weather = 0,
+  ) {
     const a = this.ctx
     if (!a || !this.gain || !this.osc1 || !this.osc2 || !this.windGain || !this.windLP) return
     const t = a.currentTime
@@ -1374,10 +1526,16 @@ export class EngineAudio {
     this.windGain.gain.setTargetAtTime(vol * 0.055 * speedPct * speedPct, t, 0.2)
     this.windLP.frequency.setTargetAtTime(500 + speedPct * 2600, t, 0.2)
     if (this.tireGain) {
-      // chirría al cargar el tren delantero y rechina sobre la banquina
+      /* chirrido de neumáticos + rodadura mojada: con lluvia o nieve el
+       * ruido de las ruedas sobre el agua es constante y delata el firme. */
       const carga = Math.max(0, lateralG - 0.38) * speedPct
-      this.tireGain.gain.setTargetAtTime(vol * (carga * 0.11 + offroad * 0.05 * speedPct), t, 0.1)
+      const agua = weather * speedPct * 0.05
+      this.tireGain.gain.setTargetAtTime(
+        vol * (carga * 0.11 + offroad * 0.05 * speedPct + agua), t, 0.1)
     }
+    /* El limitador NO altera el sonido: el motor suena natural a tope de
+     * vueltas, que resulta mucho más creíble que un corte sintético. */
+    void revLimit
   }
 
   stop() {

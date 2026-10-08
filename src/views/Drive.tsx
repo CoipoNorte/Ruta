@@ -15,9 +15,10 @@ import { AnimatePresence, motion } from 'framer-motion'
 import {
   Gauge, Volume2, VolumeX, Pause, Play, Lock, LockOpen, ChevronUp, ChevronDown,
   Milestone, Navigation, Timer as TimerIcon, Car, ChevronLeft, ChevronRight,
-  CloudRain, ShieldCheck, Users, Hand,
+  CloudRain, ShieldCheck, Users, Hand, Snowflake, CloudFog, Wind, TriangleAlert,
 } from 'lucide-react'
-import { Game, EngineAudio, kmh, MAX_SPEED } from '@/game/engine'
+import { Game, EngineAudio, kmh, MAX_SPEED, WEATHER_LABEL } from '@/game/engine'
+import type { WeatherKind } from '@/game/engine'
 import { render } from '@/game/render'
 import { cn } from '@/utils/cn'
 
@@ -61,6 +62,8 @@ export default function Drive() {
     blocked: false, zona: '',
     fork: 9999, forkSide: 1 as -1 | 1, onFork: false,
     superMode: false, flash: 0, cue: '',
+    weather: 'seco' as WeatherKind, wx: 0, grip: 1, revLimit: 0,
+    slide: 0, aqua: 0,
   })
 
   const lockRef = useRef(lock); lockRef.current = lock
@@ -122,7 +125,12 @@ export default function Drive() {
         const throttle = keyThrottle.current || inputRef.current.throttle || lockRef.current
         const brake = keyBrake.current || inputRef.current.brake
         g.update(dt, { steer, steering, throttle: throttle && !brake, brake })
-        audioRef.current.update(g.rpm, g.speedPct, throttle, g.lateralG, g.shake)
+        audioRef.current.update(
+          g.rpm, g.speedPct, throttle,
+          // el derrape suena como carga lateral: chirrido de neumáticos
+          Math.max(g.lateralG, g.slide * 0.9), g.shake,
+          g.revLimit, Math.max(g.rain, g.snow),
+        )
         // eventos de chasis → sonido y háptica
         if (g.gearChanged !== 0) audioRef.current.shift()
         if (g.hornCue) { g.hornCue = 0; audioRef.current.horn() }   // bocina cercana
@@ -145,6 +153,8 @@ export default function Drive() {
           zona: g.zona,
           fork: g.forkDist, forkSide: g.junctionSide, onFork: g.onForkLane,
           superMode: g.superMode, flash: g.forkFlash, cue: g.takenCue,
+          weather: g.weather, wx: g.wx, grip: g.grip, revLimit: g.revLimit,
+          slide: g.slide, aqua: g.aquaplane,
         })
       }
     }
@@ -417,17 +427,49 @@ export default function Drive() {
             />
           </div>
           <span className="w-7 text-right font-mono text-[10px] tabular-nums text-white/70">{hud.score}</span>
-          {hud.rain > 0.15 && (
-            <span className="flex items-center gap-1 rounded-full border border-sky-300/30 bg-sky-300/10 px-1.5 py-0.5 font-mono text-[8px] uppercase tracking-wider text-sky-200">
-              <CloudRain className="size-2.5" /> {hud.rain > 0.6 ? 'fuerte' : 'lluvia'}
-            </span>
-          )}
+          {/* Clima activo: icono y color propios de cada fenómeno. El agarre
+              perdido se muestra como porcentaje para que se entienda por qué
+              el coche frena peor. */}
+          {hud.wx > 0.15 && hud.weather !== 'seco' && (() => {
+            const estilo = {
+              lluvia: { c: 'border-sky-300/30 bg-sky-300/10 text-sky-200', I: CloudRain },
+              nieve: { c: 'border-slate-200/30 bg-slate-200/10 text-slate-100', I: Snowflake },
+              niebla: { c: 'border-zinc-300/25 bg-zinc-300/10 text-zinc-200', I: CloudFog },
+              tierra: { c: 'border-amber-500/30 bg-amber-500/10 text-amber-200', I: Wind },
+              seco: { c: '', I: CloudRain },
+            }[hud.weather]
+            return (
+              <span className={cn('flex items-center gap-1 rounded-full border px-1.5 py-0.5 font-mono text-[8px] uppercase tracking-wider', estilo.c)}>
+                <estilo.I className="size-2.5" />
+                {WEATHER_LABEL[hud.weather]}{hud.wx > 0.65 ? ' fuerte' : ''}
+                {hud.grip < 0.92 && <span className="opacity-70">· {Math.round(hud.grip * 100)}%</span>}
+              </span>
+            )
+          })()}
           {hud.blocked && (
             <span className="flex items-center gap-1 rounded-full border border-amber-300/30 bg-amber-300/10 px-1.5 py-0.5 font-mono text-[8px] uppercase tracking-wider text-amber-200">
               <Users className="size-2.5" /> retención
             </span>
           )}
         </div>
+
+        {/* Testigo de adherencia: JUSTO DEBAJO del chip de clima, alineado a
+            la derecha. Fuera de la zona central de visión, no estorba. */}
+        {(hud.slide > 0.12 || hud.aqua > 0.1) && (
+          <div className="mt-1.5 flex justify-end">
+            <span
+              className={cn(
+                'flex animate-pulse items-center gap-1 rounded-full border px-1.5 py-0.5 font-mono text-[8px] font-bold uppercase tracking-wider',
+                hud.aqua > 0.1
+                  ? 'border-red-400/50 bg-red-500/15 text-red-200'
+                  : 'border-amber-300/40 bg-amber-400/10 text-amber-200',
+              )}
+            >
+              <TriangleAlert className="size-2.5" />
+              {hud.aqua > 0.1 ? 'aquaplaning' : 'poca adherencia'}
+            </span>
+          </div>
+        )}
       </div>
 
       {/* ============================== VELOCÍMETRO ==========================
@@ -452,9 +494,16 @@ export default function Drive() {
         </div>
         {/* barra de revoluciones + marcha actual */}
         <div className="mx-auto mt-2 flex items-center gap-2">
-          <div className="h-1.5 w-32 overflow-hidden rounded-full bg-black/40 ring-1 ring-white/10">
+          <div className={cn(
+            'h-1.5 w-32 overflow-hidden rounded-full bg-black/40 ring-1 transition-shadow',
+            hud.revLimit > 0.2 ? 'ring-red-400/80 shadow-[0_0_10px_rgba(248,113,113,0.6)]' : 'ring-white/10',
+          )}>
             <div
-              className={cn('h-full rounded-full transition-[width] duration-100', hud.rpm > 0.88 ? 'bg-red-400' : velPct > 0.82 ? 'bg-amber-300' : 'bg-white/85')}
+              className={cn(
+                'h-full rounded-full transition-[width] duration-100',
+                hud.revLimit > 0.2 ? 'animate-pulse bg-red-400'
+                  : hud.rpm > 0.88 ? 'bg-red-400' : velPct > 0.82 ? 'bg-amber-300' : 'bg-white/85',
+              )}
               style={{ width: `${hud.rpm * 100}%` }}
             />
           </div>

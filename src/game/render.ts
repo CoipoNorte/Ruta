@@ -8,7 +8,7 @@
  * ==========================================================================*/
 import {
   SEG, ROAD_W, LANES, DRAW, CAM_H, CAM_DEPTH, PLAYER_W, PLAYER_Z,
-  Game, curveAt, hillAt, hash, kmh, limitAt,
+  Game, curveAt, hillAt, hash, kmh, limitAt, biomeMix,
 } from './engine'
 
 /* ------------------------------- PALETAS ---------------------------------- */
@@ -59,22 +59,13 @@ const BIOMAS: Biome[] = [
   { nombre: 'Austral',   grass: '#DCE6EE', hillFar: '#C6D6E4', hillNear: '#A8BCCE', skyTint: '#E2EEF8', skyMix: 0.3,  fog: '#D8E6F0', deco: 'nieve',  densidad: 0.3,  nieve: 1 },
 ]
 
-const BIOMA_KM = 7.5    // longitud de cada tramo de paisaje
-
-/** Bioma en un kilómetro dado: dos vecinos y su factor de mezcla. */
+/** Bioma en un kilómetro dado. La SELECCIÓN vive en el motor (`biomeMix`)
+ *  para que el clima y el paisaje pintado sean siempre el mismo bioma:
+ *  si nieva, es porque estamos en la cordillera. */
 export function biomeAt(km: number) {
-  const f = km / BIOMA_KM
-  const i = Math.floor(f)
-  const t = f - i
-  // orden pseudoaleatorio pero continuo: nunca repite el mismo dos veces
-  const idx = (n: number) => {
-    const h = hash(n * 2.137 + 11.3)
-    return BIOMAS[Math.floor(h * BIOMAS.length) % BIOMAS.length]
-  }
-  const a = idx(i), b = idx(i + 1)
-  // transición solo en el último 30 % del tramo
-  const k = t < 0.7 ? 0 : 0.5 - 0.5 * Math.cos(((t - 0.7) / 0.3) * Math.PI)
-  return { a, b, k, nombre: k < 0.5 ? a.nombre : b.nombre }
+  const { a, b, k } = biomeMix(km)
+  const A = BIOMAS[a], B = BIOMAS[b]
+  return { a: A, b: B, k, nombre: k < 0.5 ? A.nombre : B.nombre }
 }
 
 const CICLO_KM = 34
@@ -733,6 +724,40 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     pal.hillFar = mix(pal.hillFar, '#3A4048', r * 0.65)
     pal.dark = Math.min(1, pal.dark + r * 0.3)
   }
+  /* NEVADA: todo se blanquea y el cielo se cierra en gris luminoso. */
+  if (g.snow > 0.02) {
+    const s = g.snow
+    pal.skyTop = mix(pal.skyTop, '#8A94A2', s * 0.7)
+    pal.skyBot = mix(pal.skyBot, '#C2CBD4', s * 0.72)
+    pal.road1 = mix(pal.road1, '#3C4149', s * 0.5)
+    pal.road2 = mix(pal.road2, '#363B43', s * 0.5)
+    pal.grass1 = mix(pal.grass1, '#E6EEF5', s * 0.75)
+    pal.grass2 = mix(pal.grass2, '#DAE3EC', s * 0.75)
+    pal.rumble2 = mix(pal.rumble2, '#FFFFFF', s * 0.6)
+    pal.fog = mix(pal.fog, '#D2DCE6', s * 0.8)
+    pal.hillFar = mix(pal.hillFar, '#C0CCD8', s * 0.75)
+  }
+  /* POLVO EN SUSPENSIÓN: aire ocre, sol velado, contraste bajo. */
+  if (g.dust > 0.02) {
+    const d = g.dust
+    pal.skyTop = mix(pal.skyTop, '#B9884E', d * 0.6)
+    pal.skyBot = mix(pal.skyBot, '#DCA865', d * 0.72)
+    pal.road1 = mix(pal.road1, '#584B3C', d * 0.4)
+    pal.road2 = mix(pal.road2, '#524636', d * 0.4)
+    pal.grass1 = mix(pal.grass1, '#A98551', d * 0.55)
+    pal.grass2 = mix(pal.grass2, '#9E7B4A', d * 0.55)
+    pal.fog = mix(pal.fog, '#C79C5F', d * 0.85)
+    pal.hillFar = mix(pal.hillFar, '#B08A58', d * 0.8)
+  }
+  /* NIEBLA: el horizonte desaparece; el color lo pone el degradado de fog. */
+  if (g.mist > 0.02) {
+    const m = g.mist
+    pal.fog = mix(pal.fog, '#AFB8BF', m * 0.8)
+    pal.hillFar = mix(pal.hillFar, pal.fog, m * 0.85)
+    pal.hillNear = mix(pal.hillNear, pal.fog, m * 0.55)
+    pal.skyBot = mix(pal.skyBot, '#AEB7BE', m * 0.7)
+    pal.grass2 = mix(pal.grass2, pal.fog, m * 0.2)
+  }
   /* ---- PALETA RESUELTA A TUPLES RGB (una vez por frame) ----
    * Todo lo que el bucle de segmentos necesita, ya convertido y sin volver
    * a tocar una sola cadena de color dentro del bucle. */
@@ -959,7 +984,10 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     const topY = Math.max(0, maxY)
     if (H > topY + 2) {
       const [fr, fgc, fb] = hex(pal.fog)
-      const grad = ctx.createLinearGradient(0, topY, 0, H)
+      /* La visibilidad del motor comprime el degradado hacia la cámara: con
+       * niebla cerrada apenas se ve a dos coches de distancia. */
+      const vis = Math.max(0.18, g.visibility)
+      const grad = ctx.createLinearGradient(0, topY, 0, topY + (H - topY) * vis)
       /* Opaca arriba (cubre por completo la zona donde el culling subpíxel ha
        * dejado de dibujar) y se disuelve hacia la cámara: un degradado
        * continuo no puede producir bandas horizontales. */
@@ -1415,6 +1443,52 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     ctx.stroke()
     ctx.restore()
   }
+
+  /* ------------------------------- NEVADA --------------------------------
+   * Copos grandes y lentos, con deriva lateral senoidal: caen muy distinto
+   * a la lluvia, que es casi vertical y rapidísima. */
+  if (g.snow > 0.03) {
+    const n = Math.floor(g.snow * 90)
+    ctx.save()
+    ctx.fillStyle = `rgba(255,255,255,${0.5 + g.snow * 0.35})`
+    for (let i = 0; i < n; i++) {
+      const vel = 0.1 + hash(i * 1.7) * 0.16 + g.speedPct * 0.3
+      const t = (g.time * vel + hash(i * 3.1)) % 1
+      const sway = Math.sin(g.time * (0.8 + hash(i) * 1.4) + i) * W * 0.035
+      const sx = (hash(i * 7.1) * W * 1.2 - W * 0.1) + sway
+      const sy = t * (H + 20) - 10
+      const r = 0.8 + hash(i * 5.3) * 2.1
+      ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI * 2); ctx.fill()
+    }
+    ctx.restore()
+  }
+
+  /* ------------------------- POLVO EN SUSPENSIÓN --------------------------
+   * Ráfagas horizontales: el viento del desierto cruza la pantalla. */
+  if (g.dust > 0.03) {
+    ctx.save()
+    const velo = ctx.createLinearGradient(0, horizon - H * 0.1, 0, H)
+    velo.addColorStop(0, `rgba(198,150,88,${g.dust * 0.3})`)
+    velo.addColorStop(1, `rgba(198,150,88,${g.dust * 0.08})`)
+    ctx.fillStyle = velo
+    ctx.fillRect(0, horizon - H * 0.1, W, H - horizon + H * 0.1)
+    ctx.strokeStyle = `rgba(226,189,131,${0.1 + g.dust * 0.22})`
+    ctx.lineWidth = 1
+    ctx.beginPath()
+    const n = Math.floor(g.dust * 40)
+    for (let i = 0; i < n; i++) {
+      const t = (g.time * (1.4 + hash(i) * 2.2) + hash(i * 2.7)) % 1
+      const sx = t * (W + 180) - 90
+      const sy = horizon + hash(i * 9.1) * (H - horizon)
+      const len = 40 + hash(i * 4.4) * 90
+      ctx.moveTo(sx, sy); ctx.lineTo(sx + len, sy + len * 0.08)
+    }
+    ctx.stroke()
+    ctx.restore()
+  }
+
+  /* NOTA: el limitador NO tiene efecto de pantalla. Se comunica solo con la
+   * barra de revoluciones del HUD, que es donde un conductor lo miraría. */
 
   /* ------------------------------ RETROVISOR ------------------------------
    * Inset en el canvas (no un segundo lienzo): proyecta los coches que vienen

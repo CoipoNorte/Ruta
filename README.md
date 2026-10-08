@@ -367,17 +367,66 @@ densifica y frena en las zonas de 80), pero **el jugador es libre**: no hay
 multas, ni alarma, ni penalización en la puntuación. El disco solo gana opacidad
 cuando vas por encima, como referencia.
 
-### Meteorología
-`weatherAt(km)` (dos senos desfasados, recortados) genera frentes de lluvia
-deterministas a lo largo del recorrido; `Game.rain` la suaviza con `k = 0.35`.
-Efectos encadenados:
+### Meteorología ligada al bioma
+El clima **no es aleatorio: depende del paisaje**. `biomeMix(km)` vive en el
+motor y es la fuente única, así que el render pinta exactamente el bioma cuyo
+clima se está simulando: si nieva, es porque estamos en la cordillera.
 
-- **Adherencia**: `grip = 1 − rain·0.3` → frenadas más largas, menos empuje de
-  aceleración y **más fuerza centrífuga** (`CENTRIFUGAL · (2 − grip)`).
-- **Paleta**: cielo, asfalto, césped y niebla se mezclan hacia tonos fríos y
-  `dark` sube (los faros se encienden aunque sea de día).
-- **Gotas en el parabrisas**: la inclinación de las estelas depende de
-  `speedPct` (viento relativo) y la densidad de la intensidad.
+| Bioma | Fenómeno | Agarre | Visibilidad |
+|---|---|---|---|
+| Desierto | **polvo** (`dust`) | −18 % | −45 % |
+| Valle, Sierra | **lluvia** (`rain`) | −30 % | −25 % |
+| Ciudad, Bosque, Patagonia | **niebla** (`mist`) | — | **−75 %** |
+| Cordillera, Austral | **nieve** (`snow`) | **−50 %** | −40 % |
+
+Cada canal se suaviza por separado (`k = 0.35`), de modo que el final de un
+frente se solapa con el principio del siguiente sin saltos. Los frentes van y
+vienen: `power < 0.05` significa cielo despejado.
+
+**Efectos sobre la conducción (simulación)**
+El agarre no es un multiplicador único: el neumático reparte su fricción entre
+frenar y girar, y cada fenómeno degrada ejes distintos.
+
+| Fenómeno | Consecuencia al volante |
+|---|---|
+| **Frenada** | `BRAKE · firme` — la distancia de detención se alarga de verdad (hasta un 42 % más con nieve) |
+| **ABS** | Al pedir más de lo que el neumático da, el chasis **pulsa** (vibración discreta, tope 0,32) y se enciende el testigo |
+| **Tracción** | Las ruedas patinan en la salida: `patina` penaliza la aceleración cuanto más bajo el firme y menor la velocidad |
+| **Subviraje** | `understeer` crece con el volante pedido y el firme malo. La dirección pierde autoridad **pero nunca baja del 62 %**: se nota el coche "flojo" y hay que anticipar, sin perder la capacidad de cambiar de carril |
+| **Aquaplaning** | Con `rain > 0.5` y más de 140 km/h: el firme cae un 45 % extra. Aviso explícito en el HUD; se recupera levantando el pie |
+| **Viento lateral** | Rachas lentas (`crossWind`) empujan el coche de costado — se corrige con un toque de volante |
+| **Centrífuga** | `CENTRIFUGAL · (1 + (1 − grip)·0.6)` — en curva el coche se va algo más hacia fuera |
+| **Visibilidad** | `visibility` comprime el degradado de niebla hacia la cámara |
+
+**Criterio de calibración**: un simulador debe sentirse **exigente, no
+bloqueado**. El agarre tiene suelo en 0,58 y la autoridad de dirección en 0,62,
+de modo que el mal tiempo obliga a frenar antes y trazar con suavidad, pero
+**siempre permite maniobrar e incorporarse**.
+
+**Feedback al conductor**: chirrido de neumáticos al derrapar (`slide` alimenta
+el canal de carga lateral del audio), rodadura mojada constante con lluvia o
+nieve, y un **testigo de adherencia** —ámbar al patinar, rojo con
+aquaplaning— situado **bajo el chip de clima**, alineado a la derecha y fuera
+de la zona central de visión.
+- **La IA también se adapta** (`weatherPace`): el tráfico entero levanta el pie
+  y se compacta. Con excepciones deliberadas — el `corredor` apenas se inmuta
+  (factor 0,3) y por eso es quien se lleva los sustos; el `camion` cargado es
+  el más prudente (hasta 1,5); las emergencias tienen que llegar (0,55).
+
+**Visuales propios de cada fenómeno**
+- **Lluvia**: estelas inclinadas según `speedPct`, asfalto especular.
+- **Nieve**: copos redondos, grandes y lentos con **deriva senoidal** — caen
+  muy distinto a la lluvia; manto blanco en terreno y arcenes.
+- **Polvo**: velo ocre sobre el horizonte y **ráfagas horizontales** cruzando
+  la pantalla con el viento.
+- **Niebla**: colinas y cielo se funden con el color de la bruma.
+
+### Limitador del motor
+Al superar el 96 % de `MAX_SPEED` con el acelerador pisado se activa
+`revLimit`, que **solo alimenta la barra de revoluciones del HUD** (roja y
+pulsante, con halo). Sin efectos de pantalla ni cortes en el sonido del motor:
+la velocidad ya se estanca sola por la resistencia aerodinámica, y el motor a
+tope de vueltas suena más creíble sin modulación sintética.
 
 ### Retrovisor
 Situado en `max(H·0.135, 94)` px para quedar **por debajo del HUD superior**
