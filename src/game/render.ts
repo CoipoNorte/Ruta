@@ -7,7 +7,7 @@
  * después los sprites de lejos a cerca. Ciclo día/noche según el kilometraje.
  * ==========================================================================*/
 import {
-  SEG, ROAD_W, DRAW, CAM_H, CAM_DEPTH, PLAYER_W, PLAYER_Z,
+  SEG, ROAD_W, LANES, DRAW, CAM_H, CAM_DEPTH, PLAYER_W, PLAYER_Z,
   Game, curveAt, hillAt, hash, kmh, limitAt,
 } from './engine'
 
@@ -100,6 +100,34 @@ const hex = (c: string): [number, number, number] => {
   const m = c.match(/-?\d+(\.\d+)?/g)
   return m ? [Number(m[0]) || 0, Number(m[1]) || 0, Number(m[2]) || 0] : [0, 0, 0]
 }
+/* ================== RENDIMIENTO: COLORES SIN ALOCACIONES ==================
+ * `mix()`/`hex()` parsean CADENAS (regex + parseInt) y devuelven un string
+ * nuevo. Con 39 usos y varias dentro del bucle de 260 segmentos, el render
+ * alocaba miles de cadenas por frame: presión brutal sobre el GC y los
+ * consiguientes microcongelones.
+ * Aquí los colores se resuelven UNA vez por frame a tuplas numéricas
+ * reutilizadas; la caché evita incluso el parseo repetido entre frames.
+ * ======================================================================== */
+type RGB = [number, number, number]
+const rgbCache = new Map<string, RGB>()
+function toRGB(c: string): RGB {
+  let v = rgbCache.get(c)
+  if (!v) {
+    v = hex(c)
+    if (rgbCache.size > 600) rgbCache.clear()      // límite de memoria
+    rgbCache.set(c, v)
+  }
+  return v
+}
+const css = (c: RGB, a = 1) =>
+  a >= 1 ? `rgb(${c[0]},${c[1]},${c[2]})` : `rgba(${c[0]},${c[1]},${c[2]},${a})`
+const mixRGB = (a: RGB, b: RGB, t: number): RGB => [
+  (a[0] + (b[0] - a[0]) * t) | 0, (a[1] + (b[1] - a[1]) * t) | 0, (a[2] + (b[2] - a[2]) * t) | 0,
+]
+const shadeRGB = (c: RGB, k: number): RGB => k < 0
+  ? [(c[0] * (1 + k)) | 0, (c[1] * (1 + k)) | 0, (c[2] * (1 + k)) | 0]
+  : [(c[0] + (255 - c[0]) * k) | 0, (c[1] + (255 - c[1]) * k) | 0, (c[2] + (255 - c[2]) * k) | 0]
+
 const mix = (a: string, b: string, t: number) => {
   const A = hex(a), B = hex(b)
   return `rgb(${Math.round(A[0] + (B[0] - A[0]) * t)},${Math.round(A[1] + (B[1] - A[1]) * t)},${Math.round(A[2] + (B[2] - A[2]) * t)})`
@@ -126,8 +154,10 @@ export function palette(km: number): Pal {
   }
 }
 
+/* Paleta civil: tonos apagados y ningún naranja, para que el deportivo del
+ * jugador (#FF6A3D) sea inconfundible entre el tráfico. */
 const CAR_COLORS = [
-  '#D94F3D', '#E8E4DC', '#2F6FB5', '#2B2E34', '#C9A227', '#4B8C6A', '#8A5BB5',
+  '#B5443A', '#E8E4DC', '#2F6FB5', '#2B2E34', '#C9A227', '#4B8C6A', '#8A5BB5',
   '#F2F4F6',  // 7 · ambulancia (blanco)
   '#1C2E55',  // 8 · patrulla (azul policía)
 ]
@@ -160,11 +190,74 @@ function drawSiren(
 }
 
 /* ------------------------------- UTILIDADES ------------------------------- */
-function quad(ctx: CanvasRenderingContext2D, x1: number, y1: number, w1: number, x2: number, y2: number, w2: number, color: string) {
+/* Sangrado entre segmentos. Cada franja de calzada se alarga este número de
+ * píxeles HACIA LA CÁMARA, invadiendo la que ya se pintó delante (que es del
+ * mismo asfalto). Sin esto, los bordes caen en coordenadas fraccionarias, el
+ * canvas los suaviza mezclándolos con el césped del fondo y aparece una
+ * costura verde horizontal en cada unión: las "rayas" del asfalto. */
+const BLEED = 1.15
+
+function quad(
+  ctx: CanvasRenderingContext2D, x1: number, y1: number, w1: number,
+  x2: number, y2: number, w2: number, color: string, bleed = 0,
+) {
+  const yb = y1 + bleed
   ctx.fillStyle = color
   ctx.beginPath()
-  ctx.moveTo(x1 - w1, y1); ctx.lineTo(x2 - w2, y2); ctx.lineTo(x2 + w2, y2); ctx.lineTo(x1 + w1, y1)
+  ctx.moveTo(x1 - w1, yb); ctx.lineTo(x2 - w2, y2); ctx.lineTo(x2 + w2, y2); ctx.lineTo(x1 + w1, yb)
   ctx.closePath(); ctx.fill()
+}
+
+interface RoadSlice {
+  n: number
+  i: number
+  x1: number
+  y1: number
+  w1: number
+  x2: number
+  y2: number
+  w2: number
+}
+
+/* Buffers permanentes: antes se creaban dos Float64Array y hasta 180 objetos
+ * RoadSlice en cada frame. A 60 FPS eran más de 10.000 objetos/segundo. */
+const roadX = new Float64Array(DRAW + 2)
+const roadY = new Float64Array(DRAW + 2)
+const slicePool: RoadSlice[] = Array.from({ length: DRAW }, () => ({
+  n: 0, i: 0, x1: 0, y1: 0, w1: 0, x2: 0, y2: 0, w2: 0,
+}))
+
+/**
+ * Dibuja la vía como UNA ÚNICA cinta. Al no existir polígonos independientes
+ * no pueden aparecer costuras horizontales, aunque la cámara caiga entre
+ * píxeles o el navegador cambie su estrategia de antialiasing.
+ */
+function roadRibbon(
+  ctx: CanvasRenderingContext2D,
+  slices: RoadSlice[],
+  count: number,
+  widthFactor: number,
+  color: string,
+  height: number,
+) {
+  if (!count) return
+  const first = slices[0]
+  const nearY = Math.min(height + 4, Math.max(first.y1, first.y2))
+
+  ctx.fillStyle = color
+  ctx.beginPath()
+  ctx.moveTo(first.x1 - first.w1 * widthFactor, nearY)
+  for (let i = 0; i < count; i++) {
+    const s = slices[i]
+    ctx.lineTo(s.x2 - s.w2 * widthFactor, s.y2)
+  }
+  for (let i = count - 1; i >= 0; i--) {
+    const s = slices[i]
+    ctx.lineTo(s.x2 + s.w2 * widthFactor, s.y2)
+  }
+  ctx.lineTo(first.x1 + first.w1 * widthFactor, nearY)
+  ctx.closePath()
+  ctx.fill()
 }
 
 /** Oscurece/aclara un color para sombreados de carrocería. */
@@ -179,6 +272,213 @@ function rr(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: n
   ctx.beginPath()
   if (ctx.roundRect) ctx.roundRect(x, y, w, h, r)
   else ctx.rect(x, y, w, h)
+}
+
+/* ====================== COCHE DEL JUGADOR (deportivo) =====================
+ * Silueta propia, distinta del tráfico: más baja y ancha, con alerón, vía
+ * ensanchada, difusor y doble escape central. Naranja del tema (`--signal`)
+ * con franjas de competición, para que se identifique de un vistazo entre
+ * los coches civiles y combine con el HUD.
+ * ========================================================================= */
+const PLAYER_PAINT = '#FF6A3D'      // mismo naranja que el acento de la UI
+
+function drawPlayerCar(
+  ctx: CanvasRenderingContext2D, cx: number, baseY: number, w: number,
+  dark: number, brake: boolean, blinker: number, t: number,
+) {
+  if (w < 1.2) return
+  const h = w * 0.66                 // más bajo que un utilitario: deportivo
+  const y = baseY - h
+  const alto = w > 26
+  const medio = w > 12
+  const luz = 1 - dark
+  const body = toRGB(PLAYER_PAINT)
+  const pintura = css(body)
+  ctx.save()
+
+  /* --------------------------- sombra de contacto ---------------------- */
+  const sg = ctx.createRadialGradient(cx, baseY, 0, cx, baseY, w * 0.66)
+  sg.addColorStop(0, `rgba(0,0,0,${0.5 + dark * 0.2})`)
+  sg.addColorStop(1, 'rgba(0,0,0,0)')
+  ctx.fillStyle = sg
+  ctx.beginPath(); ctx.ellipse(cx, baseY, w * 0.66, Math.max(1, h * 0.14), 0, 0, Math.PI * 2); ctx.fill()
+
+  /* --------- ruedas anchas: la vía sobresale de la carrocería ---------- */
+  if (medio) {
+    const rw = w * 0.21, rh = h * 0.3
+    ctx.fillStyle = '#101115'
+    rr(ctx, cx - w * 0.52, baseY - rh, rw, rh, rw * 0.2); ctx.fill()
+    rr(ctx, cx + w * 0.52 - rw, baseY - rh, rw, rh, rw * 0.2); ctx.fill()
+    if (alto) {                       // llanta deportiva clara
+      ctx.fillStyle = 'rgba(205,212,222,0.62)'
+      ctx.fillRect(cx - w * 0.52 + rw * 0.24, baseY - rh * 0.66, rw * 0.52, rh * 0.32)
+      ctx.fillRect(cx + w * 0.52 - rw + rw * 0.24, baseY - rh * 0.66, rw * 0.52, rh * 0.32)
+    }
+  }
+
+  /* ------------------------------ carrocería ----------------------------
+   * ANATOMÍA DE LA VISTA TRASERA (de arriba abajo). Respetarla es lo que
+   * hace que el coche se "lea" bien:
+   *    0.00 h  alerón, apoyado SOBRE el portón
+   *    0.10 h  tercera luz de freno
+   *    0.14 h  luneta
+   *    0.46 h  línea de cintura
+   *    0.52 h  pilotos traseros
+   *    0.72 h  matrícula
+   *    0.80 h  paragolpes y difusor
+   * NOTA: el alerón va integrado en el borde del techo, nunca flotando por
+   * encima. En una vista trasera plana, lo que se dibuja sobre el techo se
+   * interpreta como la parte DELANTERA del coche y rompe la lectura. */
+  const bw = w                       // hombros anchos
+  const tw = w * 0.46                // cabina: MÁS ESTRECHA que el maletero
+  const roofY = y + h * 0.085        // techo real (bajo el alerón)
+  const beltY = y + h * 0.46
+
+  /* Una sola carrocería continua. La versión anterior dibujaba un segundo
+   * "maletero" debajo y ensanchaba sus puntos hasta 0,70 w, fuera del ancho
+   * real (0,50 w): por eso el coche se veía retorcido/deformado. */
+  ctx.fillStyle = pintura
+  ctx.beginPath()
+  ctx.moveTo(cx - tw / 2, roofY + h * 0.07)
+  ctx.quadraticCurveTo(cx - tw / 2, roofY, cx - tw * 0.34, roofY)      // techo
+  ctx.lineTo(cx + tw * 0.34, roofY)
+  ctx.quadraticCurveTo(cx + tw / 2, roofY, cx + tw / 2, roofY + h * 0.07)
+  ctx.quadraticCurveTo(cx + bw * 0.5, beltY, cx + bw * 0.5, beltY + h * 0.16)  // hombro
+  ctx.lineTo(cx + bw * 0.5, baseY - h * 0.1)
+  ctx.quadraticCurveTo(cx + bw * 0.5, baseY, cx + bw * 0.42, baseY)
+  ctx.lineTo(cx - bw * 0.42, baseY)
+  ctx.quadraticCurveTo(cx - bw * 0.5, baseY, cx - bw * 0.5, baseY - h * 0.1)
+  ctx.lineTo(cx - bw * 0.5, beltY + h * 0.16)
+  ctx.quadraticCurveTo(cx - bw * 0.5, beltY, cx - tw / 2, roofY + h * 0.07)
+  ctx.closePath(); ctx.fill()
+
+  // volumen: sombra lateral y brillo superior
+  const bg = ctx.createLinearGradient(cx - bw / 2, 0, cx + bw / 2, 0)
+  bg.addColorStop(0, `rgba(0,0,0,${0.4 - dark * 0.12})`)
+  bg.addColorStop(0.24, `rgba(255,255,255,${0.08 + luz * 0.1})`)
+  bg.addColorStop(0.62, 'rgba(0,0,0,0.02)')
+  bg.addColorStop(1, `rgba(0,0,0,${0.44 - dark * 0.12})`)
+  ctx.fillStyle = bg
+  ctx.fillRect(cx - bw / 2, roofY, bw, baseY - roofY)
+
+  /* --------------------- ALERÓN SOBRE EL PORTÓN TRASERO -------------------
+   * En vista trasera, el portón está DEBAJO de la luneta. Por eso el alerón
+   * debe cruzar el coche a la altura de la cintura, no arriba del techo.
+   * Montantes primero (quedan detrás), plano del alerón después. */
+  if (medio) {
+    const aw = bw * 0.84
+    const ah = Math.max(1, h * 0.055)
+    const wingY = beltY + h * 0.015
+    // montantes cortos hacia el portón
+    ctx.fillStyle = shade(PLAYER_PAINT, -0.38)
+    ctx.fillRect(cx - aw * 0.33, wingY + ah * 0.45, aw * 0.055, h * 0.09)
+    ctx.fillRect(cx + aw * 0.275, wingY + ah * 0.45, aw * 0.055, h * 0.09)
+    // plano horizontal
+    ctx.fillStyle = shade(PLAYER_PAINT, -0.18)
+    rr(ctx, cx - aw / 2, wingY, aw, ah, ah * 0.35); ctx.fill()
+    ctx.fillStyle = `rgba(255,255,255,${0.14 + luz * 0.12})`
+    ctx.fillRect(cx - aw / 2, wingY, aw, Math.max(0.6, ah * 0.25))
+    // sombra sobre el portón, inmediatamente debajo
+    ctx.fillStyle = 'rgba(0,0,0,0.34)'
+    ctx.fillRect(cx - aw * 0.46, wingY + ah, aw * 0.92, Math.max(0.5, h * 0.018))
+    if (alto) {
+      // franjas de competición también cruzan el alerón
+      ctx.fillStyle = 'rgba(252,250,245,0.8)'
+      ctx.fillRect(cx - tw * 0.17, wingY, tw * 0.12, ah)
+      ctx.fillRect(cx + tw * 0.05, wingY, tw * 0.12, ah)
+    }
+  }
+
+  /* --------------------- tercera luz de freno (alta) --------------------- */
+  if (brake && medio) {
+    ctx.fillStyle = '#FF5A48'
+    ctx.fillRect(cx - tw * 0.3, beltY - h * 0.055, tw * 0.6, Math.max(0.8, h * 0.024))
+  }
+
+  /* ------------------------------- luneta -------------------------------- */
+  if (w > 7) {
+    ctx.fillStyle = `rgba(14,19,27,${0.72 + dark * 0.22})`
+    ctx.beginPath()
+    ctx.moveTo(cx - tw * 0.4, y + h * 0.15)
+    ctx.lineTo(cx + tw * 0.4, y + h * 0.15)
+    ctx.lineTo(cx + tw * 0.54, beltY - h * 0.03)
+    ctx.lineTo(cx - tw * 0.54, beltY - h * 0.03)
+    ctx.closePath(); ctx.fill()
+    if (medio) {
+      ctx.fillStyle = `rgba(180,210,240,${0.09 + luz * 0.13})`
+      ctx.beginPath()
+      ctx.moveTo(cx - tw * 0.48, beltY - h * 0.04)
+      ctx.lineTo(cx - tw * 0.04, y + h * 0.16)
+      ctx.lineTo(cx + tw * 0.1, y + h * 0.16)
+      ctx.lineTo(cx - tw * 0.22, beltY - h * 0.04)
+      ctx.closePath(); ctx.fill()
+    }
+  }
+
+  /* ------------- franjas de competición: bajan por el portón ------------- */
+  if (medio) {
+    ctx.fillStyle = 'rgba(252,250,245,0.8)'
+    ctx.fillRect(cx - tw * 0.17, beltY, tw * 0.12, h * 0.28)
+    ctx.fillRect(cx + tw * 0.05, beltY, tw * 0.12, h * 0.28)
+  }
+
+  /* --------------------------- pilotos traseros -------------------------- */
+  const lw = Math.max(1.1, bw * 0.2), lh = Math.max(1, h * 0.11)
+  const ly = beltY + h * 0.06
+  const lx1 = cx - bw * 0.45, lx2 = cx + bw * 0.45 - lw
+  for (const lx of [lx1, lx2]) {
+    if (medio) {
+      ctx.fillStyle = 'rgba(26,18,18,0.55)'
+      rr(ctx, lx - lw * 0.07, ly - lh * 0.14, lw * 1.14, lh * 1.28, lh * 0.3); ctx.fill()
+    }
+    ctx.fillStyle = brake ? '#FF4132' : `rgba(190,38,28,${0.58 + dark * 0.42})`
+    rr(ctx, lx, ly, lw, lh, lh * 0.3); ctx.fill()
+  }
+  if ((brake || dark > 0.3) && w > 5) {
+    ctx.globalCompositeOperation = 'lighter'
+    ctx.fillStyle = brake ? 'rgba(255,66,46,0.55)' : `rgba(220,50,30,${0.15 + dark * 0.22})`
+    for (const lx of [lx1 + lw / 2, lx2 + lw / 2]) {
+      ctx.beginPath(); ctx.ellipse(lx, ly + lh / 2, w * 0.3, h * 0.2, 0, 0, Math.PI * 2); ctx.fill()
+    }
+    ctx.globalCompositeOperation = 'source-over'
+  }
+
+  /* ------------------- difusor trasero + doble escape -------------------- */
+  if (medio) {
+    ctx.fillStyle = 'rgba(20,22,26,0.72)'
+    rr(ctx, cx - bw * 0.46, baseY - h * 0.2, bw * 0.92, h * 0.17, h * 0.04); ctx.fill()
+    if (alto) {
+      // aletas del difusor
+      ctx.fillStyle = 'rgba(70,74,82,0.6)'
+      for (const o of [-0.26, -0.09, 0.08, 0.25]) {
+        ctx.fillRect(cx + bw * o, baseY - h * 0.18, bw * 0.022, h * 0.13)
+      }
+      // salidas de escape centrales
+      ctx.fillStyle = 'rgba(190,196,206,0.75)'
+      ctx.beginPath(); ctx.ellipse(cx - bw * 0.1, baseY - h * 0.055, bw * 0.045, h * 0.025, 0, 0, Math.PI * 2); ctx.fill()
+      ctx.beginPath(); ctx.ellipse(cx + bw * 0.1, baseY - h * 0.055, bw * 0.045, h * 0.025, 0, 0, Math.PI * 2); ctx.fill()
+    }
+  }
+
+  /* ----------- matrícula: sobre el paragolpes, nunca encima del difusor --- */
+  if (medio) {
+    const pw2 = bw * 0.24
+    ctx.fillStyle = `rgba(238,234,224,${0.7 - dark * 0.2})`
+    rr(ctx, cx - pw2 / 2, baseY - h * 0.3, pw2, Math.max(1, h * 0.065), h * 0.012); ctx.fill()
+  }
+
+  /* --------- intermitente: bajo el piloto, dentro del mismo grupo -------- */
+  if (blinker !== 0 && Math.floor(t * 2.6) % 2 === 0 && w > 4) {
+    const bx = blinker < 0 ? lx1 : lx2
+    const by = ly + lh * 1.12
+    ctx.fillStyle = '#FFB224'
+    rr(ctx, bx, by, lw, lh * 0.72, lh * 0.26); ctx.fill()
+    ctx.globalCompositeOperation = 'lighter'
+    ctx.fillStyle = 'rgba(255,178,36,0.48)'
+    ctx.beginPath(); ctx.ellipse(bx + lw / 2, by + lh * 0.36, w * 0.26, h * 0.15, 0, 0, Math.PI * 2); ctx.fill()
+    ctx.globalCompositeOperation = 'source-over'
+  }
+  ctx.restore()
 }
 
 /** Vehículo visto desde atrás, con silueta y sombreado tipo simulador clásico:
@@ -403,7 +703,8 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
   const terreno = bioMix('grass')
   const nieve = bioNum('nieve')
   pal.grass1 = mix(pal.grass1, terreno, 0.88)
-  pal.grass2 = mix(pal.grass2, shade(terreno, -0.1), 0.88)
+  // diferencia MUY leve entre franjas: lectura de velocidad sin parecer rayas
+  pal.grass2 = mix(pal.grass2, shade(terreno, -0.035), 0.92)
   pal.hillFar = mix(pal.hillFar, bioMix('hillFar'), 0.8)
   pal.hillNear = mix(pal.hillNear, bioMix('hillNear'), 0.8)
   pal.fog = mix(pal.fog, bioMix('fog'), 0.65)
@@ -432,6 +733,31 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     pal.hillFar = mix(pal.hillFar, '#3A4048', r * 0.65)
     pal.dark = Math.min(1, pal.dark + r * 0.3)
   }
+  /* ---- PALETA RESUELTA A TUPLES RGB (una vez por frame) ----
+   * Todo lo que el bucle de segmentos necesita, ya convertido y sin volver
+   * a tocar una sola cadena de color dentro del bucle. */
+  const P = {
+    grass1: toRGB(pal.grass1),
+    grass2: toRGB(pal.grass2),
+    road: toRGB(pal.road1),
+    rumble1: toRGB(pal.rumble1),
+    rumble2: toRGB(pal.rumble2),
+    lane: toRGB(pal.lane),
+    fog: toRGB(pal.fog),
+    talud: toRGB(mix(pal.grass2, '#5B4A38', 0.45)),
+    huella: shadeRGB(toRGB(pal.road1), -0.06),
+    rail: toRGB(mix('#9AA2AC', pal.fog, 0.35)),
+    poste: toRGB(mix('#5C636D', pal.fog, 0.3)),
+    hillFar: toRGB(pal.hillFar),
+    hillNear: toRGB(pal.hillNear),
+    dark: pal.dark,
+  }
+  // CSS strings creados una vez, no dentro de los bucles de carretera.
+  const C = {
+    grass: css(P.grass1), talud: css(P.talud), shoulder: css(P.rumble2),
+    road: css(P.road), lane: css(P.lane), rail: css(P.rail), poste: css(P.poste),
+  }
+
   const base = Math.floor(g.z / SEG)
   const pct = (g.z % SEG) / SEG
   /* CÁMARA DINÁMICA
@@ -482,10 +808,23 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
   const sunY = horizon - H * (0.03 + Math.sin(Math.min(1, Math.max(0, arco)) * Math.PI) * 0.26)
   ctx.save()
   ctx.globalCompositeOperation = 'lighter'
+  // halo amplio + núcleo denso: da el "bloom" de una fuente de luz real
   const sunG = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, W * 0.42)
   sunG.addColorStop(0, pal.sun); sunG.addColorStop(0.08, pal.sun)
   sunG.addColorStop(0.3, 'rgba(255,200,120,0.12)'); sunG.addColorStop(1, 'rgba(0,0,0,0)')
   ctx.fillStyle = sunG; ctx.beginPath(); ctx.arc(sunX, sunY, W * 0.42, 0, Math.PI * 2); ctx.fill()
+  const core = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, W * 0.1)
+  core.addColorStop(0, 'rgba(255,255,245,0.85)'); core.addColorStop(1, 'rgba(255,255,245,0)')
+  ctx.fillStyle = core; ctx.beginPath(); ctx.arc(sunX, sunY, W * 0.1, 0, Math.PI * 2); ctx.fill()
+  // destello anamórfico horizontal (lente de cámara)
+  if (pal.dark < 0.75) {
+    const fl = ctx.createLinearGradient(sunX - W * 0.5, sunY, sunX + W * 0.5, sunY)
+    fl.addColorStop(0, 'rgba(255,220,160,0)')
+    fl.addColorStop(0.5, `rgba(255,228,180,${0.16 * (1 - pal.dark)})`)
+    fl.addColorStop(1, 'rgba(255,220,160,0)')
+    ctx.fillStyle = fl
+    ctx.fillRect(sunX - W * 0.5, sunY - H * 0.012, W, H * 0.024)
+  }
   ctx.restore()
 
   /* ------------------------------ COLINAS -------------------------------- */
@@ -504,8 +843,8 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
   drawHills(H * 0.035, horizon + 10, pal.hillNear, par, 0.012)
 
   /* ------------------------------ CARRETERA ------------------------------ */
-  const xw = new Float64Array(DRAW + 2)   // x mundo del centro de calzada
-  const yw = new Float64Array(DRAW + 2)   // altura
+  const xw = roadX                         // buffers reutilizados
+  const yw = roadY
   let x = 0
   let dx = -curveAt(base) * pct
   let maxY = H
@@ -517,6 +856,9 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     x += dx; dx += curveAt(i)
   }
 
+  /* Primero solo PROYECTAMOS la vía. No se pinta aún ningún trapecio. */
+  const slices = slicePool
+  let sliceCount = 0
   for (let n = 0; n < DRAW; n++) {
     const i = base + n
     const z1 = i * SEG, z2 = z1 + SEG
@@ -528,65 +870,125 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     const Y2 = H / 2 - s2 * (yw[n + 1] - camY) * H / 2
     const W2 = s2 * ROAD_W * W / 2
     if (Y1 < Y2 || Y2 >= maxY) continue
+    const bottom = maxY
     maxY = Y2
+    if (bottom - Y2 < 0.75) continue
+    const out = slices[sliceCount++]
+    out.n = n; out.i = i
+    out.x1 = X1; out.y1 = Y1; out.w1 = W1
+    out.x2 = X2; out.y2 = Y2; out.w2 = W2
+  }
 
-    const alt = Math.floor(i / 3) % 2 === 0
-    // césped a los lados
-    ctx.fillStyle = alt ? pal.grass1 : pal.grass2
-    ctx.fillRect(0, Y2, W, Y1 - Y2 + 1)
-    // arcenes
-    quad(ctx, X1, Y1, W1 * 1.14, X2, Y2, W2 * 1.14, alt ? pal.rumble1 : pal.rumble2)
-    // calzada
-    quad(ctx, X1, Y1, W1, X2, Y2, W2, alt ? pal.road1 : pal.road2)
-    // líneas de carril discontinuas
-    if (alt) {
-      for (let l = 1; l < 3; l++) {
-        const o = (-1 + (2 * l) / 3)
-        quad(ctx, X1 + W1 * o, Y1, W1 * 0.012, X2 + W2 * o, Y2, W2 * 0.012, pal.lane)
+  /* ================= SUPERFICIES CONTINUAS ===============================
+   * Césped, talud, arcén y asfalto son una única forma cada uno. La calzada
+   * deja de tener 180 uniones internas: no hay ninguna línea horizontal que
+   * el antialiasing pueda revelar. */
+  const roadTop = sliceCount ? Math.max(0, slices[sliceCount - 1].y2) : horizon
+  ctx.fillStyle = C.grass
+  ctx.fillRect(0, Math.floor(roadTop), W, H - Math.floor(roadTop))
+  roadRibbon(ctx, slices, sliceCount, 1.3, C.talud, H)
+  roadRibbon(ctx, slices, sliceCount, 1.14, C.shoulder, H)
+  roadRibbon(ctx, slices, sliceCount, 1, C.road, H)
+
+  /* Solo quedan elementos LONGITUDINALES: marcas, ramal y guardarraíl. */
+  for (let sliceIndex = 0; sliceIndex < sliceCount; sliceIndex++) {
+    const s = slices[sliceIndex]
+    const { n, i, x1: X1, y1: Y1, w1: W1, x2: X2, y2: Y2, w2: W2 } = s
+    const alt = Math.floor(i / 4) % 2 === 0
+
+    // discontinuas y bordes solo en la zona cercana
+    if (n < 82) {
+      if (alt) {
+        for (let l = 1; l < LANES; l++) {
+          const o = -1 + (2 * l) / LANES
+          const lw = 0.012 * (3 / LANES)
+          quad(ctx, X1 + W1 * o, Y1, W1 * lw, X2 + W2 * o, Y2, W2 * lw, C.lane, BLEED)
+        }
+      }
+      quad(ctx, X1 - W1 * 0.95, Y1, W1 * 0.012, X2 - W2 * 0.95, Y2, W2 * 0.012, C.lane, BLEED)
+      quad(ctx, X1 + W1 * 0.95, Y1, W1 * 0.012, X2 + W2 * 0.95, Y2, W2 * 0.012, C.lane, BLEED)
+    }
+
+    /* Ramal de la bifurcación: uniforme y limitado a la zona visible. */
+    const dzJ = i * SEG - g.junctionZ
+    if (dzJ > -16000 && dzJ < 2500 && W1 > 1.5) {
+      const t = Math.min(1, Math.max(0, (dzJ + 16000) / 16000))
+      const ext = t * t * 1.25
+      if (ext > 0.02) {
+        const sg = g.junctionSide
+        const hw1 = W1 * ext * 0.52, hw2 = W2 * ext * 0.52
+        const cx1 = X1 + sg * (W1 + hw1), cx2 = X2 + sg * (W2 + hw2)
+        quad(ctx, cx1, Y1, hw1, cx2, Y2, hw2, C.road, BLEED)
+        if (alt) {
+          const bx1 = X1 + sg * W1, bx2 = X2 + sg * W2
+          quad(ctx, bx1, Y1, W1 * 0.02, bx2, Y2, W2 * 0.02, C.lane, BLEED)
+        }
+        quad(ctx, cx1 + sg * hw1, Y1, W1 * 0.014, cx2 + sg * hw2, Y2, W2 * 0.014, C.lane, BLEED)
       }
     }
-    // línea continua del borde
-    quad(ctx, X1 - W1 * 0.95, Y1, W1 * 0.016, X2 - W2 * 0.95, Y2, W2 * 0.016, pal.lane)
-    quad(ctx, X1 + W1 * 0.95, Y1, W1 * 0.016, X2 + W2 * 0.95, Y2, W2 * 0.016, pal.lane)
 
-    /* --- PROFUNDIDAD AMBIENTAL (estilo GT) ---------------------------------
-     * Elementos que acompañan a la calzada en toda su longitud y dan lectura
-     * de velocidad y volumen: talud lateral, guardarraíl metálico con postes
-     * y, de noche, captafaros reflectantes. Solo en los segmentos cercanos. */
-    if (n < 150 && W1 > 1.5) {
-      // talud: franja de tierra entre la calzada y el césped
-      quad(ctx, X1, Y1, W1 * 1.3, X2, Y2, W2 * 1.3, mix(pal.grass2, '#5B4A38', 0.45))
-      quad(ctx, X1, Y1, W1 * 1.14, X2, Y2, W2 * 1.14, alt ? pal.rumble1 : pal.rumble2)
-      quad(ctx, X1, Y1, W1, X2, Y2, W2, alt ? pal.road1 : pal.road2)
-
-      // guardarraíl: biga continua + poste cada 3 segmentos
+    // guardarraíl solo cerca; desaparece antes de ocupar subpíxeles
+    if (n < 64 && W1 > 3) {
       const gH1 = W1 * 0.1, gH2 = W2 * 0.1
+      const rail = C.rail, poste = C.poste
       for (const sgn of [-1, 1]) {
         const gx1 = X1 + sgn * W1 * 1.22, gx2 = X2 + sgn * W2 * 1.22
-        ctx.fillStyle = mix('#9AA2AC', pal.fog, 0.35)
+        ctx.fillStyle = rail
         ctx.beginPath()
         ctx.moveTo(gx1, Y1 - gH1); ctx.lineTo(gx2, Y2 - gH2)
         ctx.lineTo(gx2, Y2 - gH2 * 0.35); ctx.lineTo(gx1, Y1 - gH1 * 0.35)
         ctx.closePath(); ctx.fill()
         if (i % 3 === 0) {
-          ctx.fillStyle = mix('#5C636D', pal.fog, 0.3)
+          ctx.fillStyle = poste
           ctx.fillRect(gx1 - W1 * 0.012, Y1 - gH1, Math.max(0.6, W1 * 0.024), gH1)
         }
-        if (pal.dark > 0.35 && i % 6 === 0) {       // captafaros
-          ctx.fillStyle = `rgba(255,190,90,${0.35 * pal.dark})`
+        if (P.dark > 0.35 && i % 6 === 0) {         // captafaros
+          ctx.fillStyle = `rgba(255,190,90,${0.35 * P.dark})`
           ctx.fillRect(gx1 - W1 * 0.014, Y1 - gH1 * 1.05, Math.max(0.7, W1 * 0.028), Math.max(0.7, gH1 * 0.22))
         }
       }
     }
+  }
 
-    // niebla atmosférica hacia el horizonte
-    const fog = 1 - Math.exp(-((n / DRAW) ** 3.2) * 5)
-    if (fog > 0.012) {
-      ctx.globalAlpha = Math.min(1, fog)
-      ctx.fillStyle = pal.fog
-      ctx.fillRect(0, Y2, W, Y1 - Y2 + 1)
-      ctx.globalAlpha = 1
+  /* ---- NIEBLA ATMOSFÉRICA -----------------------------------------------
+   * Un ÚNICO degradado vertical sobre toda la calzada. Antes se pintaba una
+   * franja por segmento con alfa distinta, y como el alfa saltaba de banda en
+   * banda aparecían escalones horizontales en la lejanía. Con un gradiente
+   * continuo la transición es perfecta y además cuesta una sola operación. */
+  {
+    const topY = Math.max(0, maxY)
+    if (H > topY + 2) {
+      const [fr, fgc, fb] = hex(pal.fog)
+      const grad = ctx.createLinearGradient(0, topY, 0, H)
+      /* Opaca arriba (cubre por completo la zona donde el culling subpíxel ha
+       * dejado de dibujar) y se disuelve hacia la cámara: un degradado
+       * continuo no puede producir bandas horizontales. */
+      grad.addColorStop(0, `rgba(${fr},${fgc},${fb},1)`)
+      grad.addColorStop(0.08, `rgba(${fr},${fgc},${fb},0.92)`)
+      grad.addColorStop(0.22, `rgba(${fr},${fgc},${fb},0.55)`)
+      grad.addColorStop(0.42, `rgba(${fr},${fgc},${fb},0.22)`)
+      grad.addColorStop(0.7, `rgba(${fr},${fgc},${fb},0.05)`)
+      grad.addColorStop(1, `rgba(${fr},${fgc},${fb},0)`)
+      ctx.fillStyle = grad
+      ctx.fillRect(0, topY, W, H - topY)
     }
+  }
+
+  /* ------------------------- ASFALTO MOJADO -----------------------------
+   * Una sola pasada barata: la lámina de agua refleja el cielo, así que el
+   * firme se vuelve especular hacia el horizonte. Se mezcla en modo `lighter`
+   * para que actúe como reflejo y no como velo. */
+  if (g.rain > 0.12) {
+    ctx.save()
+    ctx.globalCompositeOperation = 'lighter'
+    const wet = ctx.createLinearGradient(0, horizon, 0, H)
+    const a = (g.rain - 0.12) * 0.5
+    wet.addColorStop(0, `rgba(150,180,215,${a * 0.55})`)
+    wet.addColorStop(0.35, `rgba(120,150,185,${a * 0.22})`)
+    wet.addColorStop(1, 'rgba(90,120,160,0)')
+    ctx.fillStyle = wet
+    ctx.fillRect(0, horizon, W, H - horizon)
+    ctx.restore()
   }
 
   /* ----------------- SPRITES: mobiliario + tráfico (lejos→cerca) ---------- */
@@ -642,22 +1044,52 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
           const tipo = hash(i * 3.1)
           if (tipo < 0.62) {
             /* --- VEGETACIÓN / MOBILIARIO SEGÚN EL BIOMA --- */
-            const h = (900 + hash(i * 5) * 700) * sc
-            if (h < 1) return
+            /* Porte GT4: arbolado ALTO y monumental junto a la vía. Los
+             * ejemplares varían mucho de tamaño (×1 a ×3) para que el bosque
+             * tenga escala y no parezca un seto uniforme. */
+            const h = (2600 + hash(i * 5) * 3400) * sc
+            if (h < 1.5) return
+            /* Colores cacheados POR FRAME (no por árbol): antes cada ejemplar
+             * recomputaba 3 mezclas con parseo de cadenas. */
             const deco = hash(i * 1.9) < bio.k ? bio.b.deco : bio.a.deco
-            const tronco = `rgba(42,32,24,${0.9 - pal.dark * 0.3})`
-            const follaje = mix(pal.hillNear, pal.grass1, 0.45)
+            const tronco = `rgba(42,32,24,${0.9 - P.dark * 0.3})`
+            const follaje = css(mixRGB(P.hillNear, P.grass1, 0.45))
+            const sombra = css(shadeRGB(mixRGB(P.hillNear, P.grass1, 0.45), -0.3))
+            const luzLado = css(shadeRGB(mixRGB(P.hillNear, P.grass1, 0.45), 0.16))
             switch (deco) {
-              case 'pino': {          // conífera: copa triangular en dos pisos
+              case 'pino': {
+                /* Conífera de cuatro pisos: tronco visible, copas escalonadas
+                 * que estrechan hacia arriba y sombreado lateral. */
                 ctx.fillStyle = tronco
-                ctx.fillRect(sx - h * 0.035, sy - h * 0.3, h * 0.07, h * 0.3)
-                ctx.fillStyle = nieve > 0.4 ? mix(follaje, '#E8F0F6', 0.45) : follaje
-                for (const [cy, w2, hh] of [[0.3, 0.3, 0.42], [0.58, 0.22, 0.34]] as const) {
+                ctx.fillRect(sx - h * 0.028, sy - h * 0.34, h * 0.056, h * 0.34)
+                const nevado = nieve > 0.35
+                for (const [cy, w2, hh] of [
+                  [0.22, 0.30, 0.34], [0.44, 0.25, 0.30],
+                  [0.64, 0.19, 0.26], [0.82, 0.12, 0.2],
+                ] as const) {
+                  const topY = sy - h * (cy + hh)
+                  ctx.fillStyle = nevado ? mix(follaje, '#E8F0F6', 0.4) : follaje
                   ctx.beginPath()
-                  ctx.moveTo(sx, sy - h * (cy + hh))
+                  ctx.moveTo(sx, topY)
                   ctx.lineTo(sx + h * w2, sy - h * cy)
                   ctx.lineTo(sx - h * w2, sy - h * cy)
                   ctx.closePath(); ctx.fill()
+                  if (h > 16) {       // media copa en sombra: da volumen
+                    ctx.fillStyle = sombra
+                    ctx.beginPath()
+                    ctx.moveTo(sx, topY)
+                    ctx.lineTo(sx + h * w2, sy - h * cy)
+                    ctx.lineTo(sx, sy - h * cy)
+                    ctx.closePath(); ctx.fill()
+                    if (nevado) {     // nieve acumulada en el borde superior
+                      ctx.fillStyle = 'rgba(240,248,255,0.65)'
+                      ctx.beginPath()
+                      ctx.moveTo(sx, topY)
+                      ctx.lineTo(sx + h * w2 * 0.45, sy - h * (cy + hh * 0.5))
+                      ctx.lineTo(sx - h * w2 * 0.45, sy - h * (cy + hh * 0.5))
+                      ctx.closePath(); ctx.fill()
+                    }
+                  }
                 }
                 break
               }
@@ -715,11 +1147,48 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
                 ctx.lineTo(sx - h * 0.24, sy - h * 0.22); ctx.closePath(); ctx.fill()
                 break
               }
-              default: {              // árbol de hoja ancha
+              default: {
+                /* Frondoso de copa compuesta: tronco que se bifurca y tres
+                 * masas de follaje con luz y sombra, como en un GT clásico. */
                 ctx.fillStyle = tronco
-                ctx.fillRect(sx - h * 0.045, sy - h * 0.34, h * 0.09, h * 0.34)
-                ctx.fillStyle = follaje
-                ctx.beginPath(); ctx.ellipse(sx, sy - h * 0.55, h * 0.26, h * 0.3, 0, 0, Math.PI * 2); ctx.fill()
+                ctx.beginPath()
+                ctx.moveTo(sx - h * 0.045, sy)
+                ctx.lineTo(sx - h * 0.026, sy - h * 0.44)
+                ctx.lineTo(sx + h * 0.026, sy - h * 0.44)
+                ctx.lineTo(sx + h * 0.045, sy)
+                ctx.closePath(); ctx.fill()
+                if (h > 18) {   // ramas hacia la copa
+                  ctx.strokeStyle = tronco
+                  ctx.lineWidth = Math.max(0.8, h * 0.022)
+                  ctx.beginPath()
+                  ctx.moveTo(sx, sy - h * 0.42); ctx.lineTo(sx - h * 0.14, sy - h * 0.6)
+                  ctx.moveTo(sx, sy - h * 0.42); ctx.lineTo(sx + h * 0.15, sy - h * 0.58)
+                  ctx.stroke()
+                }
+                const copa: [number, number, number, number][] = [
+                  [-0.15, 0.62, 0.21, 0.19],
+                  [0.16, 0.66, 0.19, 0.17],
+                  [0, 0.8, 0.26, 0.24],
+                ]
+                for (const [ox, oy, rx2, ry2] of copa) {
+                  ctx.fillStyle = follaje
+                  ctx.beginPath()
+                  ctx.ellipse(sx + h * ox, sy - h * oy, h * rx2, h * ry2, 0, 0, Math.PI * 2)
+                  ctx.fill()
+                  if (h > 16) {
+                    ctx.fillStyle = luzLado     // iluminación cenital-izquierda
+                    ctx.beginPath()
+                    ctx.ellipse(sx + h * (ox - rx2 * 0.3), sy - h * (oy + ry2 * 0.3),
+                      h * rx2 * 0.55, h * ry2 * 0.5, 0, 0, Math.PI * 2)
+                    ctx.fill()
+                  }
+                }
+                if (h > 16) {                   // base de la copa en sombra
+                  ctx.fillStyle = sombra
+                  ctx.beginPath()
+                  ctx.ellipse(sx + h * 0.08, sy - h * 0.56, h * 0.2, h * 0.1, 0, 0, Math.PI * 2)
+                  ctx.fill()
+                }
               }
             }
           } else {
@@ -792,6 +1261,48 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     })
   }
 
+  /* -------------------- CARTELES DE LA BIFURCACIÓN ----------------------
+   * Pórticos a 500 / 200 / 100 / 50 m anunciando el desvío. El destino es el
+   * contrario al que circulamos: desde la RUTA anuncian la SUPER y al revés. */
+  const destino = g.superMode ? 'RUTA' : 'SUPER'
+  for (const d of [500, 200, 100, 50]) {
+    const zc = g.junctionZ - d * 100
+    const nc = Math.floor(zc / SEG) - base
+    if (nc < 2 || nc >= DRAW) continue
+    const sc2 = scaleOf(zc)
+    const fr = zc / SEG - Math.floor(zc / SEG)
+    const rx = xw[nc] + (xw[nc + 1] - xw[nc]) * fr
+    const ry = yw[nc] + (yw[nc + 1] - yw[nc]) * fr
+    const sgn = g.junctionSide
+    const sx2 = W / 2 + sc2 * (rx + sgn * ROAD_W * 1.5 - camX) * W / 2
+    const sy2 = H / 2 - sc2 * (ry - camY) * H / 2
+    const k = sc2 * W / 2
+    sprites.push({
+      n: nc, z: zc,
+      draw: () => {
+        const pw2 = 1500 * k, ph = 620 * k
+        if (pw2 < 2) return
+        const topY = sy2 - 2600 * k
+        // poste y panel verde de señalización
+        ctx.fillStyle = '#4A4F57'
+        ctx.fillRect(sx2 - pw2 * 0.04, topY + ph, pw2 * 0.08, 2600 * k - ph)
+        ctx.fillStyle = '#17623C'
+        rr(ctx, sx2 - pw2 / 2, topY, pw2, ph, ph * 0.12); ctx.fill()
+        ctx.strokeStyle = 'rgba(240,244,238,0.9)'
+        ctx.lineWidth = Math.max(0.6, ph * 0.05)
+        rr(ctx, sx2 - pw2 * 0.46, topY + ph * 0.08, pw2 * 0.92, ph * 0.84, ph * 0.08); ctx.stroke()
+        if (ph > 9) {
+          ctx.fillStyle = '#F2F6F0'
+          ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+          ctx.font = `700 ${ph * 0.34}px 'JetBrains Mono', monospace`
+          ctx.fillText(`${sgn > 0 ? '' : '← '}${destino}${sgn > 0 ? ' →' : ''}`, sx2, topY + ph * 0.34)
+          ctx.font = `700 ${ph * 0.26}px 'JetBrains Mono', monospace`
+          ctx.fillText(`${d} m`, sx2, topY + ph * 0.7)
+        }
+      },
+    })
+  }
+
   /* ------------------------------ COCHE PROPIO ----------------------------
    * MISMA proyección que el tráfico: el coche es un sprite situado a PLAYER_Z
    * de la cámara, por lo que su tamaño sale de la perspectiva.
@@ -829,7 +1340,8 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
       ctx.translate(px, py)
       ctx.rotate(g.slip * 0.10 - g.roll * 0.05)   // deriva + contrabalanceo
       ctx.scale(1, 1 - g.pitch * 0.07)            // squat / dive
-      drawCar(ctx, 0, 0, pw, '#E04A2F', pal.dark, false, g.braking || g.courtesy > 0, g.blinker, g.time)
+      // silueta propia de deportivo: nada que ver con los coches civiles
+      drawPlayerCar(ctx, 0, 0, pw, pal.dark, g.braking || g.courtesy > 0, g.blinker, g.time)
       ctx.restore()
     },
   })

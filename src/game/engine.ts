@@ -12,9 +12,24 @@
 
 /* ------------------------------ CONSTANTES -------------------------------- */
 export const SEG = 300              // 3 m por segmento
-export const ROAD_W = 2000          // semiancho 10 m → 3 carriles de ~6,6 m
-export const LANES = 3
-export const DRAW = 260             // segmentos visibles (~780 m)
+
+/* ===================== DOS CARRETERAS, UNA MISMA RUTA =====================
+ * `RUTA`  : 3 carriles, tranquila, paisajística.
+ * `SUPER` : 8 carriles estilo interestatal, mucho más ancha y con más tráfico.
+ * Son `let` exportados a propósito: los módulos ES mantienen *live bindings*,
+ * así que render y engine ven el valor nuevo en cuanto cambia de carretera.
+ * ========================================================================= */
+export let ROAD_W = 2000            // semiancho (10 m → 3 carriles de ~6,6 m)
+export let LANES = 3
+export const RUTA_W = 2000, SUPER_W = 5000
+export const RUTA_LANES = 3, SUPER_LANES = 8
+/** Fija el tipo de vía. El ancho se interpola desde el motor para que la
+ *  incorporación se vea como una calzada que se abre, no como un salto. */
+export function setRoadWidth(w: number) { ROAD_W = w }
+export function setLanes(n: number) { LANES = n }
+// 180 segmentos (~540 m) son suficientes con niebla atmosférica. Los 260
+// anteriores pintaban cientos de objetos invisibles y castigaban a móviles.
+export const DRAW = 180
 export const CAM_H = 1500           // altura de cámara
 export const CAM_DEPTH = 1 / Math.tan(((92 / 2) * Math.PI) / 180)
 
@@ -199,7 +214,61 @@ export class Game {
   blockedAll = false    // true si los 3 carriles están cortados por delante
   hornCue = 0           // 1 cuando suena una bocina cerca (lo consume la vista)
   blockT = 0            // segundos seguidos sin corredor libre (escalada)
+  private unclumpAcc = 0   // acumulador del throttle anti-pelotón
   zona = ''             // nombre del paisaje actual (lo escribe el render)
+
+  /* ---- BIFURCACIÓN RUTA ↔ SUPER ---- */
+  superMode = false     // ¿vamos por la super carretera?
+  junctionZ = 0         // posición absoluta del próximo desvío
+  junctionSide: -1 | 1 = 1   // 1 = sale por la derecha · -1 = por la izquierda
+  forkFlash = 0         // destello al incorporarse
+  takenCue = ''         // texto que la vista muestra al cambiar de vía
+  private roadWTarget = RUTA_W
+
+  /** Metros hasta el próximo desvío (negativo = ya pasó). */
+  get forkDist() { return (this.junctionZ - this.pz) / 100 }
+  /** ¿Estamos colocados en el carril por el que sale el desvío? */
+  get onForkLane() {
+    return this.junctionSide > 0 ? this.x > 0.34 : this.x < -0.34
+  }
+
+  /** Programa el siguiente desvío 4–7 km más adelante. */
+  private scheduleJunction() {
+    this.junctionZ = this.pz + 400000 + Math.random() * 300000
+    this.junctionSide = Math.random() < 0.5 ? -1 : 1
+  }
+
+  /** Cambia de calzada y recoloca el tráfico para el nuevo número de carriles. */
+  private switchRoad(toSuper: boolean) {
+    this.superMode = toSuper
+    setLanes(toSuper ? SUPER_LANES : RUTA_LANES)
+    this.roadWTarget = toSuper ? SUPER_W : RUTA_W
+    this.forkFlash = 1
+    this.takenCue = toSuper ? 'SUPER CARRETERA' : 'RUTA'
+    // el jugador entra por el carril del lado por el que tomó el desvío
+    this.x = this.junctionSide > 0 ? 0.72 : -0.72
+    // reparte el tráfico por la nueva calzada, escalonado para no crear muros
+    this.cars.forEach((c, i) => {
+      c.lane = Math.min(LANES - 1, Math.floor(Math.random() * LANES))
+      if (c.kind === 'camion') c.lane = Math.min(c.lane, this.maxLaneFor(c))
+      c.x = laneCenter(c.lane)
+      c.z = this.pz + 6000 + i * (2600 + Math.random() * 2200)
+      c.ahead = true
+      c.ovPhase = 0; c.intent = 0; c.blinker = 0; c.abreast = 0; c.makeWay = 0
+    })
+    this.scheduleJunction()
+  }
+
+  /** Lógica del desvío: se evalúa al cruzar el punto de bifurcación. */
+  private updateJunction(dt: number) {
+    this.forkFlash = Math.max(0, this.forkFlash - dt * 1.6)
+    if (this.junctionZ === 0) { this.scheduleJunction(); return }
+    if (this.pz >= this.junctionZ) {
+      // al cruzarlo: si vas en el carril del ramal, te incorporas
+      if (this.onForkLane) this.switchRoad(!this.superMode)
+      else this.scheduleJunction()
+    }
+  }
 
   /** Distancia absoluta de un vehículo al coche del jugador. */
   pzDist(c: TrafficCar) { return Math.abs(c.z - this.pz) }
@@ -258,16 +327,23 @@ export class Game {
     }
   }
 
-  /** Carril preferido por personalidad (0 derecho … LANES-1 izquierdo). */
+  /** Carril preferido por personalidad, PROPORCIONAL al ancho de la vía:
+   *  en la RUTA (3) los lentos van al 0 y los rápidos al 2; en la SUPER (8)
+   *  el tráfico se reparte por franjas, como en una interestatal real. */
   private homeLane(kind: Kind, mood = 0.5): number {
-    if (kind === 'camion' || kind === 'sinprisa') return 0
-    if (kind === 'conprisa') return mood > 0.65 ? 1 : 0
-    if (kind === 'patrulla') return mood > 0.62 ? 1 : 0
-    return LANES - 1                                  // corredores y ambulancias
+    const top = LANES - 1
+    const franja = (f: number) => Math.round(top * f)
+    if (kind === 'camion') return Math.min(franja(0.1), 1)
+    if (kind === 'sinprisa') return franja(mood > 0.8 ? 0.18 : 0)
+    if (kind === 'conprisa') return franja(0.28 + mood * 0.3)
+    if (kind === 'patrulla') return franja(mood > 0.62 ? 0.5 : 0.15)
+    return top                                        // corredores y ambulancias
   }
 
-  /** Carril máximo permitido: los camiones nunca pisan el carril rápido. */
-  private maxLaneFor(c: TrafficCar) { return c.kind === 'camion' ? 1 : LANES - 1 }
+  /** Carril máximo permitido: los camiones nunca pisan los carriles rápidos. */
+  private maxLaneFor(c: TrafficCar) {
+    return c.kind === 'camion' ? Math.min(2, Math.max(1, Math.floor((LANES - 1) * 0.3))) : LANES - 1
+  }
 
   private spawn(relZ: number) {
     const z = this.z + relZ
@@ -715,9 +791,11 @@ export class Game {
 
     // densidad viva: de vez en cuando entra alguien nuevo si hay poco tráfico
     this.spawnAcc += dt
-    if (this.spawnAcc > 3 && this.cars.length < 20) {
+    // la super carretera mueve mucho más tráfico que la ruta
+    const aforo = this.superMode ? 38 : 20
+    if (this.spawnAcc > (this.superMode ? 1.2 : 3) && this.cars.length < aforo) {
       this.spawnAcc = 0
-      if (Math.random() < 0.5) this.spawn(DRAW * SEG * 0.9)
+      if (Math.random() < 0.7) this.spawn(DRAW * SEG * 0.9)
     }
   }
 
@@ -883,6 +961,12 @@ export class Game {
     const suave = !input.brake && !fuera && this.courtesy === 0 ? 1 : 0
     this.flow += ((suave ? 1 : 0.25) - this.flow) * Math.min(1, dt * 0.6)
 
+    /* el ancho de calzada se interpola: la vía "se abre" al incorporarse */
+    if (Math.abs(ROAD_W - this.roadWTarget) > 1) {
+      setRoadWidth(ROAD_W + (this.roadWTarget - ROAD_W) * Math.min(1, dt * 1.6))
+    }
+
+    this.updateJunction(dt)
     this.updateDynamics(dt)
     this.updateCompliance(dt, fuera)
     this.relieveBarrier(dt)
@@ -948,7 +1032,14 @@ export class Game {
    * de modo que se escalonan y se abre una diagonal por la que colarse.
    * --------------------------------------------------------------------- */
   private relieveBarrier(dt: number) {
-    this.unclump(dt)                      // prevención continua
+    /* `unclump` es O(n²) y con 38 coches son ~700 comparaciones: no hace falta
+     * cada frame. Se ejecuta 5 veces por segundo, suficiente para detectar
+     * emparejamientos de 2,5 s sin costar apenas CPU. */
+    this.unclumpAcc += dt
+    if (this.unclumpAcc > 0.2) {
+      this.unclump(this.unclumpAcc)
+      this.unclumpAcc = 0
+    }
 
     /* ---- GARANTÍA DE CORREDOR (corrección con escalada) -----------------
      * Regla de oro del juego: SIEMPRE debe existir un camino por delante.

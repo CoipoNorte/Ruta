@@ -59,6 +59,8 @@ export default function Drive() {
     km: 0, vel: 0, gear: 1, time: 0, ovt: 0, flow: 1, rpm: 0, shift: 0,
     limit: 120, speeding: false, rain: 0, score: 100, blinker: 0 as -1 | 0 | 1,
     blocked: false, zona: '',
+    fork: 9999, forkSide: 1 as -1 | 1, onFork: false,
+    superMode: false, flash: 0, cue: '',
   })
 
   const lockRef = useRef(lock); lockRef.current = lock
@@ -86,7 +88,12 @@ export default function Drive() {
 
     let W = 0, H = 0
     const resize = () => {
-      const dpr = Math.min(window.devicePixelRatio || 1, 2)
+      // Canvas 2D a DPR 2 en un móvil moderno puede superar 5 millones de
+      // píxeles por frame. 1.25 en táctil y 1.5 en escritorio conservan una
+      // imagen limpia y reducen el fill-rate entre 45 % y 65 %.
+      const touch = window.matchMedia('(pointer: coarse)').matches
+      const cap = touch ? 1.25 : 1.5
+      const dpr = Math.min(window.devicePixelRatio || 1, cap)
       W = cv.clientWidth; H = cv.clientHeight
       cv.width = Math.floor(W * dpr); cv.height = Math.floor(H * dpr)
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
@@ -136,6 +143,8 @@ export default function Drive() {
           limit: g.limit, speeding: g.speeding, rain: g.rain,
           score: Math.round(g.score), blinker: g.blinker, blocked: g.blockedAll,
           zona: g.zona,
+          fork: g.forkDist, forkSide: g.junctionSide, onFork: g.onForkLane,
+          superMode: g.superMode, flash: g.forkFlash, cue: g.takenCue,
         })
       }
     }
@@ -459,6 +468,43 @@ export default function Drive() {
           </span>
         </div>
       </div>
+
+      {/* ======================= AVISO DE BIFURCACIÓN ========================
+          Aparece a 600 m del desvío. Se ilumina cuando ya vas colocado en el
+          carril correcto: así sabes que al cruzarlo te incorporarás. */}
+      {hud.fork > 0 && hud.fork < 600 && (
+        <div className="pointer-events-none absolute left-1/2 top-[30%] z-20 -translate-x-1/2">
+          <div
+            className={cn(
+              'flex items-center gap-2 rounded-lg border px-3 py-1.5 backdrop-blur-sm transition-colors',
+              hud.onFork
+                ? 'border-emerald-400/70 bg-emerald-400/20 text-emerald-200'
+                : 'border-white/15 bg-black/35 text-white/70',
+            )}
+          >
+            {hud.forkSide < 0 && <ChevronLeft className="size-4" />}
+            <span className="font-mono text-[11px] font-bold uppercase tracking-[0.2em]">
+              {hud.superMode ? 'Ruta' : 'Super'} · {Math.round(hud.fork)} m
+            </span>
+            {hud.forkSide > 0 && <ChevronRight className="size-4" />}
+          </div>
+          <p className="mt-1 text-center font-mono text-[8px] uppercase tracking-[0.18em] text-white/40">
+            {hud.onFork ? 'listo para tomarlo' : `mantente a la ${hud.forkSide > 0 ? 'derecha' : 'izquierda'}`}
+          </p>
+        </div>
+      )}
+
+      {/* Confirmación al incorporarse a la otra calzada */}
+      {hud.flash > 0.05 && (
+        <div
+          className="pointer-events-none absolute left-1/2 top-[42%] z-30 -translate-x-1/2 text-center"
+          style={{ opacity: Math.min(1, hud.flash) }}
+        >
+          <p className="font-display text-3xl font-black uppercase tracking-tight drop-shadow-[0_2px_16px_rgba(0,0,0,0.9)]">
+            {hud.cue}
+          </p>
+        </div>
+      )}
 
       {/* ===================== SUPERFICIE DE DIRECCIÓN =======================
           Capa a pantalla completa (z-10): queda POR DEBAJO del HUD, los pedales

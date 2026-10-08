@@ -11,6 +11,36 @@ simulación, el render pseudo-3D y el audio corren en el navegador.
 > (referencia Mazda Demio) dibujada en una sola pasada — techo estrecho y
 > abovedado que cae en hombros anchos, luneta grande con spoiler, pilotos
 > verticales envolventes en las esquinas y paragolpes oscuro. LOD en 3 niveles.
+>
+> **Coche del jugador** (`drawPlayerCar`): silueta propia de **deportivo**,
+> claramente distinta del tráfico civil. Proporción más baja (`h = w · 0.66`
+> frente a `0.8`), cabina de cupé estrecha, **vía ensanchada** con ruedas que
+> sobresalen de la carrocería, **difusor con aletas** y **doble escape
+> central**. Pintado en el naranja del tema (`PLAYER_PAINT = #FF6A3D`, el mismo
+> `--color-signal` del HUD) con franjas de competición que continúan sobre el
+> alerón y bajan por el portón. La paleta civil se ajustó (el rojo pasó a
+> `#B5443A`) para que ningún NPC compita con ese naranja.
+>
+> **Anatomía de la vista trasera** — una sola carrocería continua, sin piezas
+> superpuestas:
+>
+> | Altura | Elemento |
+> |---|---|
+> | 0,09 h | Techo de la cabina |
+> | 0,14 h | Luneta con reflejo (lo más lejano del coche) |
+> | 0,46 h | Línea de cintura |
+> | 0,47 h | **Alerón apoyado sobre el portón, debajo de la luneta** |
+> | 0,52 h | Pilotos traseros y tercera luz de freno |
+> | 0,72 h | Matrícula |
+> | 0,80 h | Paragolpes, difusor y escapes |
+>
+> **Corrección definitiva del deportivo.** La versión anterior superponía dos
+> carrocerías y llevaba los puntos del supuesto maletero hasta `0,70 w`, fuera
+> del ancho físico máximo `0,50 w`; por eso la silueta se deformaba. Además el
+> alerón estaba arriba del techo, posición que en una vista trasera se lee como
+> el frente. Ahora hay una sola silueta simétrica dentro de `±0,50 w`, y el
+> alerón cruza el portón a la altura `beltY + 0,015 h`, justo debajo de la
+> luneta, con montantes hacia abajo. Esa es inequívocamente la parte trasera.
 
 ## Stack
 
@@ -127,6 +157,66 @@ screenY = H/2 − scale · (yMundo − camY) · H/2
   tierra entre calzada y césped, **guardarraíl metálico** con biga continua
   proyectada en perspectiva, postes cada 3 segmentos y **captafaros
   reflectantes** de noche. Dan lectura de velocidad y volumen al corredor.
+- **Huellas de rodadura**: dos bandas pulidas por carril (`shade(road, −0.07)`),
+  calculadas sobre `LANES`, que añaden textura y lectura de velocidad.
+- **Bloom de luz**: el sol/luna combina halo amplio + núcleo denso y un
+  **destello anamórfico horizontal** (atenuado por `1 − dark`), todo en modo
+  `lighter`.
+- **Asfalto mojado**: con `rain > 0.12` una sola pasada en `lighter` añade el
+  reflejo especular del cielo desde el horizonte hacia la cámara.
+
+- **Arbolado monumental (GT4)**: coníferas de **cuatro pisos** con tronco
+  visible, sombreado de media copa y nieve acumulada en el borde superior;
+  frondosos con tronco bifurcado, ramas y **copa compuesta de tres masas** con
+  luz cenital y base en sombra. Altura base de 2600–6000 u (antes 900–1600),
+  con variación ×1–×3 entre ejemplares para dar escala al bosque.
+
+> **Bug corregido — rayas horizontales de colores sobre el asfalto.** La causa
+> definitiva era el **culling subpíxel**: a partir de cierta distancia cada
+> segmento mide menos de un píxel de alto, y pintarlo igualmente producía medio
+> píxel de césped y medio de asfalto, con el anti-aliasing mezclando ambos →
+> **una banda horizontal de color arbitrario por segmento**. Con 260 segmentos
+> eso es, literalmente, un patrón de rayas. Se suma la alternancia de arcén y
+> hierba cada 3 segmentos, que en la lejanía también caía en subpíxeles.
+>
+> Solución:
+> - **No se dibuja ningún segmento de menos de 0,75 px** de alto; esa zona la
+>   cubre la niebla, que es un degradado continuo y por construcción no puede
+>   generar bandas.
+> - **LOD de detalle**: más allá del segmento 110 la hierba y el arcén se
+>   pintan en color plano, sin alternancia. Las marcas de carril desaparecen.
+> - **Firme de un solo tono** en calzada, repintado, huellas y ramal.
+> - Niebla en **un único degradado vertical** con 6 paradas de alfa, opaco en
+>   el horizonte para tapar la zona culled.
+> - Césped a **píxeles enteros** y sangrado de 1,15 px (`BLEED`) por si acaso.
+
+> Notas históricas del mismo bug (parches previos que no bastaron):
+> 1. El césped se rellenaba hasta `Y1 + 1`; como los segmentos se pintan de
+>    cerca a lejos, ese píxel sobrante caía sobre el asfalto ya dibujado.
+> 2. **Costuras de anti-aliasing**: los bordes de cada polígono caen en
+>    coordenadas fraccionarias y el canvas los suaviza mezclándolos con el
+>    fondo, dejando una línea por unión.
+> 3. **La niebla se pintaba por segmento** con un alfa distinto cada uno, así
+>    que el propio degradado producía escalones horizontales en la lejanía.
+> 4. **La causa principal**: el asfalto **alternaba entre `road1` y `road2`
+>    cada 3 segmentos**. Era deliberado (truco arcade para dar sensación de
+>    velocidad), pero en una calzada ancha se lee como un fallo de render.
+>
+> Solución definitiva:
+> - **Firme de un solo color** (`pal.road1`) en la calzada, el repintado
+>   cercano, las huellas de rodadura y el ramal del desvío. Al compartir tono,
+>   las uniones entre segmentos dejan de ser visibles por completo.
+> - Bandas de césped ajustadas a **píxeles enteros** (`floor`/`ceil` + 1 px) y
+>   con diferencia entre franjas reducida a `shade(−0.035)`: lectura de
+>   velocidad sin parecer rayas.
+> - **Sangrado de 1,15 px** (`BLEED` en `quad(..., bleed)`) hacia la cámara en
+>   todas las franjas de calzada, arcén, talud y huellas.
+> - **Niebla en un único degradado vertical** sobre toda la vía, construido
+>   con `hex(pal.fog)` y cinco paradas de alfa: transición perfecta y una sola
+>   operación de dibujo.
+>
+> La sensación de velocidad la aportan ahora los arcenes (que sí alternan
+> rojo/blanco, como un bordillo real) y las líneas discontinuas.
 - **Vehículos de emergencia**: barra de luces en el techo con alternancia
   azul/rojo a 3,5 Hz, halo proyectado por composición `lighter` y franjas de
   identificación en el costado.
@@ -325,6 +415,40 @@ derecha de la pantalla, por lo que `laneCenter(l) = 1 − (2l+1)/LANES`. El
 hacia `−x`, es decir `lane++`. Tenerlo espejado hacía que los NPC señalizaran
 al lado contrario y pareciera que "se devolvían".
 
+## Dos calzadas: RUTA ↔ SUPER
+
+No son dos modos de juego separados, sino **una bifurcación dentro del mismo
+viaje**: cada 4–7 km aparece un desvío señalizado que conecta las dos vías.
+
+| | RUTA | SUPER |
+|---|---|---|
+| Carriles (`LANES`) | 3 | **8** |
+| Semiancho (`ROAD_W`) | 2000 u (20 m) | **5000 u (50 m)** |
+| Aforo de tráfico | 20 vehículos | **38** |
+| Frecuencia de spawn | 3 s | 1,2 s |
+
+**Cómo se toma el desvío**
+1. `scheduleJunction()` coloca la bifurcación 4–7 km adelante y sortea el lado.
+2. Al aproximarse, un **carril de incorporación se abre progresivamente**
+   (`ext = t²·1.25`) hacia el lado señalizado, con cebreado y borde propio.
+3. Pórticos verdes a **500 / 200 / 100 / 50 m** anuncian el destino contrario
+   al que circulas (`SUPER →` desde la ruta, `← RUTA` desde la super).
+4. Al cruzar el punto, si vas **en el carril del ramal** (`onForkLane`,
+   `|x| > 0.34` hacia ese lado) te incorporas; si no, sigues y se programa el
+   siguiente desvío.
+5. `switchRoad()` cambia `LANES`, **interpola `ROAD_W`** (la calzada se abre,
+   no salta), te coloca en el carril de entrada y **redistribuye el tráfico**
+   escalonado para la nueva anchura.
+
+`ROAD_W` y `LANES` son `export let` — los *live bindings* de ES Modules hacen
+que render y engine vean el valor nuevo sin pasar parámetros. El HUD muestra el
+aviso de distancia, que **se ilumina en verde** cuando ya estás colocado.
+
+Los carriles preferidos son **proporcionales** (`homeLane` usa franjas de
+`LANES - 1`), así que en la super el tráfico se reparte como en una
+interestatal en vez de amontonarse a la derecha. Los camiones nunca pasan del
+30 % izquierdo de la calzada.
+
 ### Personalidades de conductor (`Kind`)
 El tráfico no es homogéneo: cada vehículo tiene una forma de entender la
 carretera, y de ella dependen su velocidad objetivo, su carril natural y su
@@ -472,14 +596,49 @@ scroll, zoom y pull-to-refresh durante el juego.
 - Superior: odómetro (2 decimales), tiempo, adelantamientos, mute y pausa.
 - Barra de **ritmo**: sube conduciendo suave, lejos de la banquina y sin frenadas.
 
-## Bucle y rendimiento
+## Rendimiento (60 FPS)
 
-- `requestAnimationFrame` con `dt` real acotado a 50 ms (evita saltos al volver
-  de segundo plano); `visibilitychange` pausa automáticamente.
-- El canvas se escala por `devicePixelRatio` **capado a 2**.
-- React **no** se re-renderiza por frame: el HUD se actualiza a ~12 Hz vía
-  `setHud`, y la perilla del volante se anima con `rAF` escribiendo
-  `style.transform` directamente.
+> **Microcongelones — causa y solución.** El render llamaba a `mix()`/`hex()`
+> (regex + `parseInt` + asignación de un string nuevo) **39 veces**, varias de
+> ellas dentro del bucle de 260 segmentos y de los árboles. Eso son **miles de
+> cadenas alocadas por frame**: presión constante sobre el recolector de
+> basura, que se manifiesta como pausas de unos milisegundos exactamente cada
+> pocas decenas de frames.
+
+Medidas aplicadas:
+
+- **Carretera como cinta continua**: el asfalto ya no se dibuja con 180–260
+  trapecios independientes. Primero se proyectan los puntos visibles y luego
+  `roadRibbon()` construye un único `Path2D` lógico para terreno, talud, arcén
+  y firme. Al no existir uniones internas, las rayas horizontales quedan
+  eliminadas por construcción, no ocultadas con parches.
+- **Distancia de dibujo**: 260 → **180 segmentos** (~540 m); el horizonte
+  restante lo resuelve la niebla continua.
+- **Resolución interna adaptada al dispositivo**: DPR máximo 1,25 en pantallas
+  táctiles y 1,5 en escritorio (antes 2). Reduce el fill-rate entre 45 % y
+  65 % en móviles de alta densidad.
+- **Buffers permanentes de proyección** (`roadX`, `roadY`, `slicePool`): no se
+  crean `Float64Array` ni cientos de objetos `RoadSlice` en cada frame.
+- **Estilos CSS del firme cacheados una vez por frame** (`C`): no se formatean
+  colores dentro de los bucles de marcas y guardarraíles.
+
+- **Paleta resuelta a tuplas RGB una vez por frame** (`P`) con caché de parseo
+  (`toRGB` + `Map`). Dentro de los bucles no se toca ni una cadena de color:
+  `mixRGB`/`shadeRGB` operan sobre números y `css()` solo formatea al asignar
+  el `fillStyle`.
+- **`unclump` con throttle**: es O(n²) (~700 comparaciones con 38 coches). Se
+  ejecuta 5 veces por segundo en lugar de 60; basta para detectar
+  emparejamientos de 2,5 s.
+- **LOD espacial**: el volumen ambiental (talud, huellas, guardarraíl,
+  captafaros) se dibuja solo en los **90 segmentos más cercanos** (antes 150) y
+  exige `W1 > 2`. Las marcas de carril desaparecen más allá del segmento 110.
+- **Culling temprano de árboles** (`h < 3`) y colores de follaje cacheados por
+  frame en lugar de recomputarse por ejemplar.
+- `requestAnimationFrame` con `dt` real acotado a 50 ms; `visibilitychange`
+  pausa automáticamente.
+- Canvas escalado por `devicePixelRatio` **capado a 2**.
+- React **no** se re-renderiza por frame: HUD a ~12 Hz vía `setHud`, perilla
+  del volante animada con `rAF` escribiendo `style.transform`.
 - Estado del juego en `useRef` (`Game`), nunca en estado de React.
 
 ## Build
