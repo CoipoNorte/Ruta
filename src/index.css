@@ -1,4 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=Archivo:wght@400;600;700;800;900&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 @import "tailwindcss";
 
 /* ============================================================================
@@ -12,9 +11,10 @@
   --color-cream: #F1EFEA;
   --color-signal:#FF6A3D;
 
-  --font-display: 'Archivo', system-ui, sans-serif;
-  --font-sans: 'Inter', system-ui, sans-serif;
-  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  /* Fuentes del sistema: cero solicitudes externas, sin bloqueos de cliente. */
+  --font-display: 'Arial Black', 'Segoe UI', system-ui, sans-serif;
+  --font-sans: 'Segoe UI', Roboto, Helvetica, Arial, system-ui, sans-serif;
+  --font-mono: 'Cascadia Mono', 'SFMono-Regular', Consolas, 'Liberation Mono', monospace;
 }
 
 html, body, #root { height: 100%; }

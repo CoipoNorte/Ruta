@@ -53,6 +53,35 @@ simulación, el render pseudo-3D y el audio corren en el navegador.
 | Audio | WebAudio — motor, viento y neumáticos sintetizados, sin archivos |
 | Alias | `@/*` → `src/*` |
 
+## Consola limpia y dependencias externas
+
+La build no contiene analítica, publicidad, rastreadores ni scripts remotos.
+También se eliminó Google Fonts: la UI usa fuentes del sistema, por lo que
+RUTA no realiza ninguna solicitud de red después de cargar `index.html`.
+
+`consola-limpia.bat` compila y abre `vite preview` como página de nivel
+superior en `127.0.0.1`, sin el iframe del visor de desarrollo. Sirve para
+separar los errores de la aplicación de los que inyecta el anfitrión.
+
+Cuando RUTA detecta `window.self !== window.top`, añade un botón de enlace
+externo al HUD. Este abre la URL del juego en una pestaña de nivel superior y
+elimina el parámetro `embed`. El botón no existe en GitHub Pages.
+
+Los siguientes mensajes **no existen en `src/`, `index.html` ni en la build
+`dist/index.html`** (comprobado por búsqueda literal):
+
+- `dead-clicks-autocapture.js`
+- `run-ad-auction`, `join-ad-interest-group`, `private-aggregation`
+- `attribution-reporting`, `ambient-light-sensor`, `battery`, `vr`
+- el recurso con hash `v4bc70e...`
+
+Son generados por el iframe, las cabeceras `Permissions-Policy` y la analítica
+del visor que contiene el juego. `ERR_BLOCKED_BY_CLIENT` significa que una
+extensión del navegador bloqueó uno de esos recursos del anfitrión. Una página
+hija no puede modificar las cabeceras HTTP ni el atributo `sandbox` de su
+iframe padre; por eso la validación correcta se realiza con
+`consola-limpia.bat` o en GitHub Pages.
+
 ## Configuración de despliegue
 
 ```ts
@@ -68,6 +97,10 @@ plugins: [react(), tailwindcss(), viteSingleFile()]
   "deploy": "gh-pages -d dist"
 }
 ```
+
+**Atajo en Windows**: `deploy.bat` aplica ambos cambios de forma idempotente
+(con Node, para no romper el JSON) y encadena `npm i` → `npm run build` →
+`npm run deploy`. Si `base` ya existe, no lo duplica.
 
 `npm run deploy` → publica `dist/` en la rama `gh-pages`.
 Con *singlefile* no hay assets externos, así que `base` actúa solo como red de
@@ -230,12 +263,40 @@ screenY = H/2 − scale · (yMundo − camY) · H/2
   emite `gearChanged` y `shiftFlash` para sonido y HUD.
 - Aceleración con caída aerodinámica: `ACCEL(560) · (1 − 0.62·speedPct)`
   → 0–100 km/h en ~6 s; frenada `BRAKE(1250)`, retención `DRAG(180)` al soltar.
-- Dirección **con tracción real**:
-  `x += steer · STEER_RATE(1.7) · (0.45 + 0.55·min(1, 2.4·speedPct)) · rodando · dt`
-  donde `rodando = min(1, speed/1200)`. Un coche **no se traslada de lado**: las
-  ruedas giran, pero la trayectoria solo cambia si avanza. Con el coche parado
-  el volante se mueve y no pasa nada (antes había un suelo de 0,55 que permitía
-  desplazarlo lateralmente a velocidad cero, impropio de un simulador).
+- **Dirección: modelo de bicicleta.** El volante no mueve el coche de lado —
+  lo **orienta**, y el chasis avanza hacia donde apunta el morro:
+  ```
+  ψ̇ = steer · YAW_MAX(0.62) · shape(v) · autoridad   (guiñada, rad/s)
+  ψ -= curve · v / SEG²                              (el trazado gira bajo el coche)
+  ψ -= ψ · YAW_STABILITY(1.35) · dt                  (avance/caster: se endereza solo)
+  ẋ  = sin(ψ) · v / ROAD_W                           (única fuente de lateral)
+  ```
+  `shape(v)` modela la cremallera que endurece con la velocidad: parado no
+  gira (no hay avance), a ~32 km/h ya responde al máximo y a 200 km/h entrega
+  un 30 % menos de guiñada.
+
+  **Calibración**: `YAW_MAX = 2.15` rad/s y `YAW_STABILITY = 2.4` dan una
+  constante de tiempo de 0,42 s y un cambio de carril en **~0,5 s** a velocidad
+  de autopista. El giro del trazado (`roadYaw`) se atenúa al 55 % para que una
+  curva no consuma media dirección y **siga siendo posible adelantar dentro de
+  ella**. La autoridad nunca baja del 75 % con mal tiempo.
+
+  `STEER_ATTACK = 60`: el volante **sigue** al dedo en lugar de perseguirlo.
+  Con el valor anterior (22) un gesto rápido dejaba `steer` a mitad de camino
+  y **el tope de giro real nunca se alcanzaba**, de ahí la sensación de coche
+  pesado.
+
+  > **Bug corregido — "se conduce como sobre hielo".** La versión anterior
+  > hacía `x += steer · RATE · dt`: el volante **trasladaba el coche de lado**
+  > como un cursor sobre la pista, sin orientación ni inercia. Por eso se
+  > sentía patinar en vez de conducir. Con el modelo de guiñada aparece el
+  > retardo característico: giras → el morro rota → *recién entonces* el coche
+  > empieza a cruzarse; centras → sigue cruzado hasta que lo enderezas con una
+  > corrección. El sprite rota según `heading` real, no según el volante.
+  >
+  > La **fuerza centrífuga artificial desapareció**: ahora el efecto emerge
+  > solo. Si no corriges en curva, el trazado gira bajo el coche y te abres
+  > hacia el exterior, exactamente como en la realidad.
 - Volante: sigue al dedo con `STEER_ATTACK = 22`/s y se auto-centra a
   `RETURN_RATE = 10`/s al soltar.
 - **Fuerza centrífuga**: `x -= curve · speedPct² · CENTRIFUGAL(0.085) · dt`.
@@ -421,6 +482,26 @@ de la zona central de visión.
   la pantalla con el viento.
 - **Niebla**: colinas y cielo se funden con el color de la bruma.
 
+### Caja manual secuencial (opcional)
+Se activa en el menú de pausa (**Caja de cambios → Manual**) y se recuerda en
+`localStorage['ruta-manual']`.
+
+Con `manual = true` la caja **deja de subir sola**:
+
+1. Cada marcha tiene su **techo real** (34/61/92/127/166/210 km/h). Al
+   alcanzarlo el motor queda contra el corte y el coche **no acelera más**.
+2. A partir del 90 % del régimen de la marcha se habilita el cambio
+   (`canShift`): la barra de revoluciones y el número de marcha **parpadean en
+   verde**, como el *shift light* de un secuencial.
+3. Para subir hay que **soltar y volver a pisar** el acelerador. Se detecta por
+   **flanco de subida** (`throttleWasUp`), y solo cuenta si la aguja está en
+   zona verde — así no se pueden saltar marchas pisando repetidamente.
+4. Las **reducciones son automáticas**: por debajo del 86 % del régimen mínimo
+   la caja baja sola para no calar (al frenar nadie espera un toque de pedal).
+
+En modo automático (por defecto) nada de esto se aplica: la marcha sale
+directamente de la velocidad, como antes.
+
 ### Limitador del motor
 Al superar el 96 % de `MAX_SPEED` con el acelerador pisado se activa
 `revLimit`, que **solo alimenta la barra de revoluciones del HUD** (roja y
@@ -480,14 +561,74 @@ viaje**: cada 4–7 km aparece un desvío señalizado que conecta las dos vías.
 1. `scheduleJunction()` coloca la bifurcación 4–7 km adelante y sortea el lado.
 2. Al aproximarse, un **carril de incorporación se abre progresivamente**
    (`ext = t²·1.25`) hacia el lado señalizado, con cebreado y borde propio.
-3. Pórticos verdes a **500 / 200 / 100 / 50 m** anuncian el destino contrario
-   al que circulas (`SUPER →` desde la ruta, `← RUTA` desde la super).
+3. Pórticos verdes a **2000 / 1000 / 500 / 200 / 100 m** anuncian el destino
+   contrario al que circulas (`SUPER →` desde la ruta, `← RUTA` desde la
+   super), con la misma cuenta atrás en el chip del HUD.
 4. Al cruzar el punto, si vas **en el carril del ramal** (`onForkLane`,
    `|x| > 0.34` hacia ese lado) te incorporas; si no, sigues y se programa el
    siguiente desvío.
 5. `switchRoad()` cambia `LANES`, **interpola `ROAD_W`** (la calzada se abre,
-   no salta), te coloca en el carril de entrada y **redistribuye el tráfico**
-   escalonado para la nueva anchura.
+   no salta) y redistribuye el tráfico para la nueva anchura.
+
+**Incorporación realista**
+- Entras por el **carril de incorporación** real: `laneCenter(entryLane)`,
+  donde `entryLane` es 0 (derecho) o `LANES−1` (izquierdo) según el lado del
+  ramal. Funciona igual con 3 u 8 carriles.
+- El tráfico se reparte **delante y detrás** (≈38 % detrás). *Bug corregido*:
+  antes `switchRoad` colocaba **todos** los coches por delante, así que el
+  **retrovisor quedaba vacío** durante kilómetros y la SUPER parecía desierta.
+- Ningún coche aparece pegado al carril por el que entras.
+- **Ventana de cortesía** (`mergeT = 3,2 s`): los coches de tu carril colaboran
+  — el de delante estira (`boost`) y el de detrás afloja (`relax`), de modo que
+  siempre hay hueco donde encajar.
+- **El ramal es transitable**: `rampWidthAt(z, junctionZ)` es la **misma
+  función** en motor y render, así que lo que ves asfaltado es exactamente lo
+  que puedes pisar. Los límites `limDer`/`limIzq` se ensanchan por el lado del
+  desvío, de modo que circular por él **no dispara la penalización de banquina**
+  (antes vibraba y frenaba como si fueras por tierra).
+- **Sin obstáculos sobre la salida**: el **guardarraíl se interrumpe** en el
+  lado del ramal mientras el desvío está abierto (si no, la biga cruzaba por
+  encima del asfalto y parecía una barrera), y el mobiliario de carretera se
+  retira más allá del ancho de la salida (`despeje = 1.35 + ramp·1.25`).
+- Umbral de `onForkLane` relajado a **0,2**: basta con ir por la mitad
+  exterior de la calzada. Tomar la salida es cómodo, no un ejercicio de
+  puntería.
+
+### Retrovisor
+Reescrito desde cero con una **geometría única**. Todo —calzada, carriles y
+vehículos— se proyecta con la misma función:
+
+```
+s = FILL(2600) / max(d, 520)             escala perspectiva (1/distancia)
+x = hx + (xNorm − g.x + bend) · s · (mw/2)
+y = hy + (base − hy) · min(1.35, s)
+```
+
+`FILL` es la distancia a la que la calzada completa llena el ancho del cristal.
+Como `xNorm` ya está **normalizado** (−1 … 1 = bordes de la vía), el espejo es
+independiente de `ROAD_W` y `LANES`: encuadra la carretera entera lo mismo con
+3 carriles que con 8.
+
+El tamaño de cada coche se **deriva de su medida real**:
+`cw = (c.width / ROAD_W) · s · (mw/2) · 2.1`, con el mismo factor de
+legibilidad 2,1 de la vista principal. La proporción coche/calzada resulta
+idéntica en el parabrisas y en el espejo (20 %).
+
+`bend` reproduce la curvatura con la **misma doble integración** que la vista
+principal (`offset ≈ curve · n²/2`, normalizado por `ROAD_W` y acotado a ±1,1),
+así que la vía se desvía de forma coherente al mirar atrás.
+
+Incluye: carcasa con bisel, cielo y terreno, trapecio de calzada, bordes y
+separaciones de carril, **difuminado en la niebla** de los lejanos, luces de
+freno e intermitentes, sirenas de emergencia, reflejo del cristal, algoritmo
+del pintor (lejos → cerca) y **testigo de punto ciego** ámbar en el lado
+ocupado, como el de un retrovisor moderno.
+
+> **Bug corregido**: el tamaño de los vehículos era `s · mw · 0.3`, un valor
+> arbitrario sin relación con el ancho real — a 14 m daba 96 px en un cristal
+> de 320 px, **seis veces más grande de lo que corresponde**. Los coches
+> tapaban el espejo y no cuadraban con los carriles, que usaban otra fórmula
+> distinta: había dos proyecciones incompatibles conviviendo.
 
 `ROAD_W` y `LANES` son `export let` — los *live bindings* de ES Modules hacen
 que render y engine vean el valor nuevo sin pasar parámetros. El HUD muestra el
@@ -597,15 +738,17 @@ Cada coche (`TrafficCar`) conduce "bien":
 
 | Control | Implementación |
 |---|---|
-| **Volante = toda la pantalla** | Capa a pantalla completa (z-10) bajo HUD/pedales. El punto donde apoyas el dedo se vuelve el centro del volante virtual: `pointerdown` fija `x0` y el arrastre da `steer = curva((x−x0)/drag)` con `curva(d) = sign(d)·\|d\|^1.35` (preciso al centro, rápido en los extremos) |
-| Recorrido adaptativo | `drag = clamp(ancho·0.22, 62, 110)` px → mismo gesto en móvil pequeño o tablet |
+| **Volante = toda la pantalla** | Capa a pantalla completa (z-10) bajo HUD/pedales. El punto donde apoyas el dedo se vuelve el centro del volante virtual: `pointerdown` fija `x0` y el arrastre da `steer = curva((x−x0)/drag)` |
+| **Curva de respuesta** | Por tramos, con el reparto de un volante real: el **primer 35 % del gesto da el 25 % del giro** (correcciones finas de carril) y el resto cubre el 75 % restante. Continua y **llega a 1,0 exacto**, así que el giro máximo siempre es alcanzable. *Antes* era `\|d\|^1.35`, que a medio recorrido devolvía 0,39 — se perdía el 22 % del mando justo en la zona más usada |
+| Recorrido adaptativo | `drag = clamp(ancho·0.19, 58, 96)` px → mismo gesto en móvil pequeño o tablet |
+| **Teclado con rampa** | Una tecla es binaria, así que el giro **crece progresivamente** (~0,45 s al tope, suelta en ~0,3 s). Da el control gradual que el táctil logra con el recorrido del dedo |
 | Multitáctil | Cada puntero se identifica por `pointerId`: el **primero** dirige y los demás quedan libres para los pedales. Se puede **mantener el giro con un pulgar mientras el otro acelera y frena** sin que la dirección se interrumpa |
 | Re-enganche | Si el sistema cancela el puntero del volante (gesto del SO, notificación) y el dedo sigue apoyado, el siguiente `pointermove` **lo recupera** tomando la posición actual como nuevo centro. No hay que levantar y volver a pulsar |
 | Anillo guía | Aparece en el punto de agarre con una perilla que sigue al dedo (animada por rAF leyendo `game.steer`) |
 | Auto-centrado | Al soltar, `steering = false` y el motor interpola `steer → 0` a `RETURN_RATE = 10`/s (muelle en la simulación, no en la UI) |
 | Acelerador / freno | Botones `pointerdown/up` con `setPointerCapture` en la columna derecha |
 | **Traba** | Mantiene el acelerador pisado (crucero) → se conduce solo con el dedo que dirige |
-| Indicador inferior | Barra de 6 px pegada al borde inferior con marca de centro y perilla que recorre el riel (`left = 50 + steer·44 %`). `pointer-events-none`: es **solo lectura**, el control real es la superficie completa |
+| Indicador inferior | Barra de 6 px pegada al borde inferior. Mide su ancho real (`clientWidth`) y calcula `maxTravel = ancho/2 − perilla/2 − 2`; luego mueve la perilla `dx = game.steer · maxTravel`. Contrato exacto: `−1` borde izquierdo, `0` centro, `+1` borde derecho. `pointer-events-none`: es **solo lectura**, el control real es la superficie completa |
 | Intermitentes | Dos botones de 32 px sobre los pedales, o `Q` / `E`; auto-apagado a los 6 s. **Se ven encendidos en el propio coche**, igual que las luces de freno al pisar el pedal |
 | **Modo zurdo** | Selector en el menú de pausa que mueve toda la columna de pedales a la izquierda. Se guarda en `localStorage['ruta-lado']`. El volante sigue siendo la pantalla completa, así que no cambia |
 | Teclado | Flechas/WASD, `ESPACIO` traba, `Q`/`E` intermitentes, `ESC` pausa (pruebas en escritorio) |

@@ -39,10 +39,25 @@ const BRAKE = 1250
 const DRAG = 180                    // retención del motor al soltar
 const OFFROAD_MAX = 1700            // ≈ 61 km/h en la banquina
 const OFFROAD_DECEL = 1400
-const STEER_RATE = 1.7              // unidades de calzada por segundo a tope
-const CENTRIFUGAL = 0.085
+/* ---- DIRECCIÓN: parámetros del modelo de bicicleta ----
+ * El coche NO se traslada de lado: las ruedas lo ORIENTAN y él avanza hacia
+ * donde apunta su morro. De ahí la inercia que distingue conducir de patinar. */
+const YAW_MAX = 2.15                // rad/s de guiñada a tope de volante
+const YAW_STABILITY = 2.4           // avance/caster: tiende a alinearse solo
 const RETURN_RATE = 10              // auto-centrado del volante
-const STEER_ATTACK = 22             // rapidez con que el volante sigue al dedo
+/* El volante debe SEGUIR al dedo, no perseguirlo: con 22 quedaba a mitad de
+ * camino en gestos rápidos y nunca se alcanzaba el tope real de giro. */
+const STEER_ATTACK = 60             // rapidez con que el volante sigue al dedo
+
+/** Ensanche del ramal de incorporación en una `z` dada (0 = sin ramal).
+ *  Lo comparten motor y render: todo lo que VES asfaltado, es transitable. */
+export function rampWidthAt(z: number, junctionZ: number): number {
+  const dz = z - junctionZ
+  if (dz < -26000 || dz > 4000) return 0
+  // crece pronto y se mantiene ancho: una salida cómoda, no un embudo
+  const t = Math.max(0, Math.min(1, (dz + 26000) / 19000))
+  return Math.min(1, t * t * 1.35) * 1.5
+}
 
 /* Geometría del coche propio. El render PROYECTA estas medidas con la misma
  * fórmula que el tráfico, así la escala nunca se desajusta (antes era un
@@ -240,6 +255,18 @@ export class Game {
   shiftFlash = 0        // >0 justo tras un cambio de marcha
   gearChanged = 0       // 1 subida · -1 reducción · 0 nada (se consume por frame)
 
+  /* ---- CAJA MANUAL SECUENCIAL (opcional) -----------------------------
+   * Con `manual = true` la caja deja de subir sola: hay que SOLTAR y volver
+   * a pisar el acelerador cuando la aguja llega al rojo para engranar la
+   * siguiente marcha. Mientras no lo hagas, el motor queda contra el corte
+   * y el coche no acelera más — como una secuencial de verdad.
+   * Las reducciones sí son automáticas (al frenar nadie espera un toque). */
+  manual = false
+  gearHeld = 1          // marcha engranada ahora mismo
+  canShift = false      // true cuando la aguja está en zona roja
+  missedShift = 0       // >0 avisando de que toca cambiar
+  private throttleWasUp = true   // flanco de subida del acelerador
+
   /* ---- CONDUCCIÓN RESPONSABLE (capa de simulador) ---- */
   /* Canales de clima independientes y suavizados: permiten mezclar el final
    * de un frente con el principio del siguiente sin saltos. */
@@ -257,6 +284,9 @@ export class Game {
    * El agarre no es un número único: un neumático tiene un círculo de
    * fricción que se reparte entre FRENAR y GIRAR. Con el firme deslizante
    * cada eje se degrada de forma distinta, y aparecen fenómenos propios. */
+  heading = 0           // guiñada del coche respecto a la carretera (rad)
+  limDer = 1            // borde transitable derecho (se amplía con el ramal)
+  limIzq = 1            // borde transitable izquierdo
   slide = 0             // 0..1 el coche está perdiendo adherencia AHORA
   understeer = 0        // 0..1 subviraje: giras y el coche sigue recto
   crossWind = 0         // viento lateral (desierto/patagonia) en u/s
@@ -283,13 +313,16 @@ export class Game {
   junctionSide: -1 | 1 = 1   // 1 = sale por la derecha · -1 = por la izquierda
   forkFlash = 0         // destello al incorporarse
   takenCue = ''         // texto que la vista muestra al cambiar de vía
+  mergeT = 0            // >0: ventana de cortesía al incorporarse a la vía
   private roadWTarget = RUTA_W
 
   /** Metros hasta el próximo desvío (negativo = ya pasó). */
   get forkDist() { return (this.junctionZ - this.pz) / 100 }
-  /** ¿Estamos colocados en el carril por el que sale el desvío? */
+  /** ¿Estamos colocados en el carril por el que sale el desvío?
+   *  Umbral generoso (0,2): basta con ir por la mitad exterior de la calzada.
+   *  Tomar la salida debe ser cómodo, no un ejercicio de puntería. */
   get onForkLane() {
-    return this.junctionSide > 0 ? this.x > 0.34 : this.x < -0.34
+    return this.junctionSide > 0 ? this.x > 0.2 : this.x < -0.2
   }
 
   /** Programa el siguiente desvío 4–7 km más adelante. */
@@ -305,16 +338,38 @@ export class Game {
     this.roadWTarget = toSuper ? SUPER_W : RUTA_W
     this.forkFlash = 1
     this.takenCue = toSuper ? 'SUPER CARRETERA' : 'RUTA'
-    // el jugador entra por el carril del lado por el que tomó el desvío
-    this.x = this.junctionSide > 0 ? 0.72 : -0.72
-    // reparte el tráfico por la nueva calzada, escalonado para no crear muros
-    this.cars.forEach((c, i) => {
-      c.lane = Math.min(LANES - 1, Math.floor(Math.random() * LANES))
-      if (c.kind === 'camion') c.lane = Math.min(c.lane, this.maxLaneFor(c))
+
+    /* El jugador sale por el CARRIL DE INCORPORACIÓN, que es el del borde
+     * por el que tomó el ramal. Se calcula con `laneCenter` para que valga
+     * igual en una vía de 3 carriles que en una de 8. */
+    const entryLane = this.junctionSide > 0 ? 0 : LANES - 1
+    this.x = laneCenter(entryLane)
+    this.mergeT = 3.2            // ventana de cortesía al incorporarse
+
+    /* REPARTO DEL TRÁFICO: una parte DELANTE y otra DETRÁS. Antes se
+     * colocaban todos delante, así que el retrovisor quedaba vacío durante
+     * kilómetros y la incorporación parecía una autopista desierta. Ahora
+     * uno se integra a un flujo vivo, con coches que te alcanzan por detrás. */
+    let atras = 0, alante = 0
+    this.cars.forEach((c) => {
+      const detras = Math.random() < 0.38
+      // carril: respeta la franja natural de cada personalidad
+      c.lane = Math.min(this.maxLaneFor(c), this.homeLane(c.kind, c.mood))
+      if (Math.random() < 0.45) {
+        c.lane = Math.min(this.maxLaneFor(c), Math.floor(Math.random() * LANES))
+      }
+      // nadie aparece pegado al carril por el que entramos
+      if (c.lane === entryLane && Math.random() < 0.7) {
+        c.lane = Math.min(this.maxLaneFor(c), Math.max(0, entryLane + (entryLane === 0 ? 1 : -1)))
+      }
       c.x = laneCenter(c.lane)
-      c.z = this.pz + 6000 + i * (2600 + Math.random() * 2200)
-      c.ahead = true
-      c.ovPhase = 0; c.intent = 0; c.blinker = 0; c.abreast = 0; c.makeWay = 0
+      c.z = detras
+        ? this.pz - 4000 - (atras++) * (3200 + Math.random() * 2600)
+        : this.pz + 5000 + (alante++) * (2800 + Math.random() * 2400)
+      c.ahead = c.z > this.pz
+      c.speed = c.desired
+      c.ovPhase = 0; c.intent = 0; c.blinker = 0; c.abreast = 0
+      c.makeWay = 0; c.evade = 0; c.pressure = 0
     })
     this.scheduleJunction()
   }
@@ -322,6 +377,22 @@ export class Game {
   /** Lógica del desvío: se evalúa al cruzar el punto de bifurcación. */
   private updateJunction(dt: number) {
     this.forkFlash = Math.max(0, this.forkFlash - dt * 1.6)
+
+    /* ---- CORTESÍA DE INCORPORACIÓN -------------------------------------
+     * Durante unos segundos tras entrar en la vía, el tráfico que comparte
+     * nuestro carril colabora: el de delante estira y el de detrás levanta
+     * el pie, de modo que siempre hay hueco donde encajar. Es lo que hace
+     * que entrar a la SUPER se sienta fluido y no un salto brusco. */
+    if (this.mergeT > 0) {
+      this.mergeT -= dt
+      for (const c of this.cars) {
+        if (Math.abs(c.x - this.x) > 0.3) continue
+        const d = c.z - this.pz
+        if (d > 0 && d < 9000) c.boost = Math.max(c.boost, 0.8)      // estira
+        else if (d < 0 && d > -9000) c.relax = Math.max(c.relax, 0.8) // afloja
+      }
+    }
+
     if (this.junctionZ === 0) { this.scheduleJunction(); return }
     if (this.pz >= this.junctionZ) {
       // al cruzarlo: si vas en el carril del ramal, te incorporas
@@ -950,8 +1021,29 @@ export class Game {
       ? Math.min(1, this.revLimit + dt * 6)
       : Math.max(0, this.revLimit - dt * 3)
 
+    /* ---- TECHO DE LA MARCHA (solo en manual) ---------------------------
+     * Cada marcha tiene su velocidad máxima: contra el corte el motor no
+     * empuja más. Esto es lo que obliga a cambiar para seguir acelerando. */
+    if (this.manual) {
+      const tope = [0, 34, 61, 92, 127, 166, 210][this.gearHeld] / 0.036
+      if (this.speed > tope) {
+        this.speed -= (this.speed - tope) * Math.min(1, dt * 7)
+        this.revLimit = Math.min(1, this.revLimit + dt * 6)
+      }
+    }
+
+    /* --- CALZADA TRANSITABLE -------------------------------------------
+     * El RAMAL de incorporación es asfalto de verdad: circular por él no
+     * debe penalizar. Se calcula su ensanche con la misma función que usa
+     * el render (`rampWidthAt`), así lo que ves pintado es exactamente lo
+     * que puedes pisar sin que el coche vibre ni frene. */
+    const ramp = rampWidthAt(this.pz, this.junctionZ)
+    // margen extra: el borde del ramal nunca penaliza por un pelo
+    this.limDer = this.junctionSide > 0 ? 1 + ramp * 1.1 + 0.12 : 1
+    this.limIzq = this.junctionSide < 0 ? 1 + ramp * 1.1 + 0.12 : 1
+
     /* --- banquina: se puede pisar, pero frena y vibra (sin castigo real) --- */
-    const fuera = Math.abs(this.x) > 1
+    const fuera = this.x > this.limDer || this.x < -this.limIzq
     if (fuera) {
       if (this.speed > OFFROAD_MAX) this.speed -= OFFROAD_DECEL * dt
       this.shake = Math.min(1, this.shake + dt * 4)
@@ -960,47 +1052,61 @@ export class Game {
     }
     this.speed = Math.max(0, Math.min(MAX_SPEED, this.speed))
 
-    /* --- DIRECCIÓN ------------------------------------------------------
-     * Un coche no se traslada de lado: las ruedas giran, pero el coche solo
-     * cambia de trayectoria SI AVANZA. El desplazamiento lateral es
-     * proporcional a la velocidad hasta ~43 km/h y a partir de ahí se
-     * estabiliza (de lo contrario a 200 km/h sería incontrolable).
-     * Antes el factor tenía un suelo de 0,55 y se podía desplazar el coche
-     * parado girando el volante — impropio de un simulador. */
+    /* ===================== DIRECCIÓN: MODELO DE BICICLETA ===============
+     * ERROR CORREGIDO: antes era `x += steer · RATE · dt`, es decir, el
+     * volante DESPLAZABA el coche de lado como un cursor sobre la pista.
+     * Por eso se sentía como patinar sobre hielo: sin orientación ni inercia.
+     *
+     * Un coche real no se mueve lateralmente. Las ruedas delanteras lo
+     * ORIENTAN (guiñada) y el chasis avanza hacia donde apunta el morro:
+     *     guiñada  ψ̇ = v / L · tan(δ)      (modelo de bicicleta)
+     *     lateral  ẋ = v · sin(ψ) / ROAD_W
+     * Eso produce el retardo característico de conducir: giras → el morro
+     * rota → recién entonces el coche empieza a cruzarse; centras → el coche
+     * SIGUE cruzado hasta que lo enderezas con una corrección.
+     * ==================================================================== */
     const pct = this.speedPct
-    const rodando = Math.min(1, this.speed / 1200)      // 0 parado · 1 ≳43 km/h
+    const v = this.speed
 
-    /* ---- SUBVIRAJE: el tren delantero deja de morder -------------------
-     * Con firme deslizante, cuanto MÁS volante pides, menos te hace caso el
-     * coche. Es la sensación clásica de la nieve: giras y sigues recto.
-     * Sobre lámina de agua la dirección se queda casi sin efecto. */
+    /* ---- SUBVIRAJE: el tren delantero deja de morder ---- */
     const exigencia = Math.abs(this.steer) * (0.35 + 0.65 * pct)
-    const objUnder = clamp01((1 - firme) * 0.85 * exigencia + this.aquaplane * 0.5)
+    const objUnder = clamp01((1 - firme) * 0.7 * exigencia + this.aquaplane * 0.45)
     this.understeer += (objUnder - this.understeer) * Math.min(1, dt * 3.5)
-    /* La autoridad nunca baja del 62 %: se nota que el coche va "flojo" y
-     * hay que anticipar, pero SIEMPRE se puede cambiar de carril. Un
-     * simulador se siente exigente, no bloqueado. */
-    const autoridad = 1 - this.understeer * 0.38
+    // nunca por debajo del 75 %: el mal tiempo exige anticipar, no bloquea
+    const autoridad = 1 - this.understeer * 0.25
 
-    this.x += this.steer * STEER_RATE * (0.45 + 0.55 * Math.min(1, pct * 2.4))
-      * rodando * autoridad * dt
+    /* La cremallera "endurece" con la velocidad: a 180 km/h el mismo gesto
+     * del volante da mucho menos ángulo que a 50, igual que en un coche real
+     * con dirección asistida variable. Parado no gira: no hay avance. */
+    // responde desde muy poca velocidad y conserva mando en punta
+    const shape = Math.min(1, v / 650) * (1 - 0.22 * clamp01((v - 1800) / 3800))
+    const yawCmd = this.steer * YAW_MAX * shape * autoridad
+
+    /* El trazado gira BAJO el coche: si no corriges, en curva te abres. Esto
+     * sustituye a la antigua fuerza centrífuga artificial — ahora el efecto
+     * emerge solo de la física. Atenuado para que una curva no consuma media
+     * dirección y siga siendo posible adelantar dentro de ella. */
+    const roadYaw = this.curve * v / (SEG * SEG) * 0.55
+    this.heading += (yawCmd - roadYaw) * dt
+    // estabilidad direccional (avance de la dirección): se endereza sola
+    this.heading -= this.heading * Math.min(1, YAW_STABILITY * dt)
+    this.heading = Math.max(-0.5, Math.min(0.5, this.heading))
+
+    // avance en la dirección del morro: ESTA es la única fuente de lateral
+    this.x += Math.sin(this.heading) * v * dt / ROAD_W
 
     /* ---- VIENTO LATERAL: hay que corregir constantemente --------------- */
     if (this.crossWind !== 0) this.x += this.crossWind * (0.25 + pct * 0.75) * dt
 
-    // al perder adherencia el coche se descoloca un poco: obliga a corregir,
-    // pero con una amplitud contenida para que no sea errático
+    // al perder adherencia el coche se descoloca un poco: obliga a corregir
     if (this.understeer > 0.4 && pct > 0.35) {
       this.slide = Math.max(this.slide, this.understeer * 0.6)
       this.wobble += (Math.random() - 0.5) * this.understeer * 0.4 * dt
     }
-    /* --- fuerza centrífuga: hay que apoyar el volante en las curvas ---
-     *     con asfalto mojado empuja más hacia fuera (menos agarre) --- */
-    this.x -= this.curve * pct * pct * CENTRIFUGAL * (1 + (1 - this.grip) * 0.6) * dt
     /* descontrol residual del roce: empuja el coche y se amortigua solo.
      * También depende de que el coche esté rodando (si está parado no derrapa). */
     if (this.wobble !== 0) {
-      this.x += this.wobble * rodando * dt
+      this.x += this.wobble * Math.min(1, v / 1200) * dt
       this.wobble *= Math.max(0, 1 - dt * 2.4)
       if (Math.abs(this.wobble) < 0.002) this.wobble = 0
     }
@@ -1010,7 +1116,8 @@ export class Game {
       this.nudgeSelf *= Math.max(0, 1 - dt * 5)
       if (Math.abs(this.nudgeSelf) < 0.002) this.nudgeSelf = 0
     }
-    this.x = Math.max(-1.32, Math.min(1.32, this.x))
+    // el ramal amplía la calzada transitable por su lado (ver `fuera`)
+    this.x = Math.max(-(this.limIzq + 0.32), Math.min(this.limDer + 0.32, this.x))
 
     /* --- CONTACTO: nunca hay choque destructivo, y SOBRE TODO nunca un
      * "enganche eterno". Si al cambiar de carril tocamos a alguien por detrás,
@@ -1120,7 +1227,7 @@ export class Game {
     this.updateCompliance(dt, fuera)
     this.relieveBarrier(dt)
     this.updateTraffic(dt)
-    this.updateGear()
+    this.updateGear(input.throttle)
   }
 
   /** Hueco libre por delante del jugador en cada carril (unidades de mundo). */
@@ -1387,8 +1494,11 @@ export class Game {
     this.lateralG = Math.min(1, Math.abs(lat) * 1.7)
     this.roll += (lat - this.roll) * Math.min(1, dt * 7)
 
-    // deriva: la carrocería gira un poco antes que la trayectoria
-    this.slip += (this.steer * (0.3 + 0.7 * pct) - this.slip) * Math.min(1, dt * 9)
+    /* Deriva visual: el morro apunta a donde el coche REALMENTE está
+     * orientado (`heading`), amplificado para que se lea en pantalla. Antes
+     * se derivaba del volante, por eso el sprite giraba sin que el coche
+     * cambiara de dirección — justo la sensación de "cursor" que había. */
+    this.slip += (this.heading * 2.6 - this.slip) * Math.min(1, dt * 9)
 
     // cámara con inercia: a más velocidad, más pegada; en maniobra, se retrasa
     this.camLag += (this.x - this.camLag) * Math.min(1, dt * (3.4 + 4.2 * pct))
@@ -1404,13 +1514,54 @@ export class Game {
     this.shiftFlash = Math.max(0, this.shiftFlash - dt * 2.6)
   }
 
-  /** Caja automática de 6 marchas: solo informativa + sonido del motor. */
-  private updateGear() {
+  /** Caja de 6 marchas. En AUTOMÁTICO sube sola; en MANUAL hay que
+   *  confirmar cada subida soltando y volviendo a pisar el acelerador. */
+  private updateGear(throttle = false) {
     const v = kmh(this.speed)
     const lim = [0, 32, 58, 88, 122, 160, 999]
-    let g = 1
-    for (let i = 1; i < lim.length; i++) if (v >= lim[i]) g = i + 1
-    this.gear = Math.min(6, g)
+
+    if (!this.manual) {
+      /* ---------------- AUTOMÁTICO: la marcha sale de la velocidad -------- */
+      let g = 1
+      for (let i = 1; i < lim.length; i++) if (v >= lim[i]) g = i + 1
+      this.gear = Math.min(6, g)
+      this.gearHeld = this.gear
+      this.canShift = false
+      this.missedShift = 0
+    } else {
+      /* ---------------- MANUAL SECUENCIAL --------------------------------
+       * 1. La marcha la decide el jugador, no la velocidad.
+       * 2. Al llegar al corte (`rpm` alto) se habilita el cambio.
+       * 3. Soltar y volver a pisar engrana la siguiente.
+       * 4. Si te quedas corto de vueltas, la caja reduce sola para no calar. */
+      const loH = lim[this.gearHeld - 1]
+      const hiH = lim[this.gearHeld] === 999 ? 210 : lim[this.gearHeld]
+      const rel = (v - loH) / (hiH - loH)
+
+      // reducción automática: por debajo del régimen mínimo de la marcha
+      if (this.gearHeld > 1 && v < loH * 0.86) {
+        this.gearHeld--
+      }
+
+      this.canShift = this.gearHeld < 6 && rel >= 0.9
+
+      /* Flanco de subida del acelerador: soltar + pisar = engranar. Solo
+       * cuenta si la aguja está en rojo, así no se puede saltar marchas. */
+      if (!throttle) {
+        this.throttleWasUp = true
+      } else if (this.throttleWasUp) {
+        this.throttleWasUp = false
+        if (this.canShift) {
+          this.gearHeld++
+          this.missedShift = 0
+        }
+      }
+
+      // aviso luminoso mientras el cambio está pendiente
+      this.missedShift = this.canShift ? 1 : 0
+      this.gear = this.gearHeld
+    }
+
     const lo = lim[this.gear - 1], hi = lim[this.gear] === 999 ? 210 : lim[this.gear]
     this.rpm = 0.18 + 0.82 * Math.max(0, Math.min(1, (v - lo) / (hi - lo)))
 

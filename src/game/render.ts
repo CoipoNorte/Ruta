@@ -8,7 +8,7 @@
  * ==========================================================================*/
 import {
   SEG, ROAD_W, LANES, DRAW, CAM_H, CAM_DEPTH, PLAYER_W, PLAYER_Z,
-  Game, curveAt, hillAt, hash, kmh, limitAt, biomeMix,
+  Game, curveAt, hillAt, hash, kmh, limitAt, biomeMix, rampWidthAt,
 } from './engine'
 
 /* ------------------------------- PALETAS ---------------------------------- */
@@ -935,11 +935,10 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     }
 
     /* Ramal de la bifurcación: uniforme y limitado a la zona visible. */
-    const dzJ = i * SEG - g.junctionZ
-    if (dzJ > -16000 && dzJ < 2500 && W1 > 1.5) {
-      const t = Math.min(1, Math.max(0, (dzJ + 16000) / 16000))
-      const ext = t * t * 1.25
-      if (ext > 0.02) {
+    // misma función que el motor: lo pintado es exactamente lo transitable
+    const ext = rampWidthAt(i * SEG, g.junctionZ)
+    if (ext > 0.02 && W1 > 1.5) {
+      {
         const sg = g.junctionSide
         const hw1 = W1 * ext * 0.52, hw2 = W2 * ext * 0.52
         const cx1 = X1 + sg * (W1 + hw1), cx2 = X2 + sg * (W2 + hw2)
@@ -957,6 +956,10 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
       const gH1 = W1 * 0.1, gH2 = W2 * 0.1
       const rail = C.rail, poste = C.poste
       for (const sgn of [-1, 1]) {
+        /* Se INTERRUMPE en el lado del ramal mientras el desvío está abierto:
+         * si no, la biga cruzaría por encima del asfalto de la salida y
+         * parecería una barrera obstruyendo la incorporación. */
+        if (ext > 0.02 && sgn === g.junctionSide) continue
         const gx1 = X1 + sgn * W1 * 1.22, gx2 = X2 + sgn * W2 * 1.22
         ctx.fillStyle = rail
         ctx.beginPath()
@@ -1032,7 +1035,12 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
     // la densidad depende del bioma: un bosque está poblado, el desierto no
     if (!esKm && !esLimite && h1 > 0.085 * (0.35 + bioNum('densidad') * 1.3)) continue
     const lado = esKm || esLimite ? 1 : hash(i + 7) < 0.5 ? -1 : 1
-    const off = (1.35 + hash(i + 3) * 0.9) * lado
+    /* Nada se planta sobre el ramal: en el lado del desvío el mobiliario se
+     * retira más allá del asfalto de la salida (o se omite si no cabe). */
+    const rampHere = rampWidthAt(i * SEG, g.junctionZ)
+    const despeje = lado === g.junctionSide ? 1.35 + rampHere * 1.25 : 1.35
+    if (rampHere > 0.02 && lado === g.junctionSide && (esKm || esLimite)) continue
+    const off = (despeje + hash(i + 3) * 0.9) * lado
     const s = scaleOf(i * SEG)
     const sx = W / 2 + s * (xw[n] + off * ROAD_W - camX) * W / 2
     const sy = H / 2 - s * (yw[n] - camY) * H / 2
@@ -1293,7 +1301,7 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
    * Pórticos a 500 / 200 / 100 / 50 m anunciando el desvío. El destino es el
    * contrario al que circulamos: desde la RUTA anuncian la SUPER y al revés. */
   const destino = g.superMode ? 'RUTA' : 'SUPER'
-  for (const d of [500, 200, 100, 50]) {
+  for (const d of [2000, 1000, 500, 200, 100]) {
     const zc = g.junctionZ - d * 100
     const nc = Math.floor(zc / SEG) - base
     if (nc < 2 || nc >= DRAW) continue
@@ -1497,70 +1505,174 @@ export function render(ctx: CanvasRenderingContext2D, g: Game, W: number, H: num
   drawMirror(ctx, g, W, H, pal)
 }
 
+/* ============================= RETROVISOR ==================================
+ * Reescrito desde cero con una geometría ÚNICA y coherente.
+ *
+ * Por qué fallaba el anterior: el tamaño de los coches era `s · mw · 0.3`,
+ * un número arbitrario SIN relación con el ancho real del vehículo. A 14 m
+ * daba 96 px en un cristal de 320 px — seis veces más grande de lo que
+ * corresponde. Los coches tapaban el espejo y no cuadraban con los carriles,
+ * que sí usaban otra fórmula distinta. Dos proyecciones incompatibles.
+ *
+ * Ahora TODO (calzada, carriles, vehículos) sale de la misma función `proj`:
+ *
+ *   s  = FILL / d                         escala perspectiva (1/distancia)
+ *   x  = cx + (xNorm − g.x) · s · (mw/2)  lateral
+ *   y  = hy + (base − hy) · s             altura sobre el horizonte
+ *
+ * `FILL` es la distancia a la que la calzada COMPLETA llena el ancho del
+ * cristal. Como `xNorm` ya viene normalizado (−1 … 1 = bordes de la vía), el
+ * espejo es independiente de `ROAD_W` y de `LANES`: encuadra la carretera
+ * entera lo mismo con 3 carriles que con 8.
+ *
+ * El ancho de cada coche se deriva de su medida real:
+ *   wNorm = c.width / ROAD_W        (fracción de calzada que ocupa)
+ *   cw    = wNorm · s · (mw/2) · 2.1
+ * El 2,1 es el mismo factor de legibilidad que usa la vista principal, así
+ * que las proporciones coinciden entre el parabrisas y el espejo.
+ * ========================================================================= */
 function drawMirror(ctx: CanvasRenderingContext2D, g: Game, W: number, H: number, pal: Pal) {
-  const mw = Math.min(W * 0.58, 290)
-  const mh = Math.max(44, Math.min(H * 0.072, 62))
+  /* ---- marco y encuadre ---- */
+  const mw = Math.min(W * 0.66, 340)
+  const mh = Math.max(54, Math.min(H * 0.094, 78))
   const mx = (W - mw) / 2
-  /* Queda POR DEBAJO del HUD superior (odómetro + barra de conducción), que
-   * ocupa unos 86 px. En pantallas altas baja proporcionalmente. */
   const my = Math.max(H * 0.135, 94)
+  const r = 8
 
+  const FILL = 2600          // a esta distancia la calzada llena el cristal
+  const FAR = 20000          // alcance útil (200 m)
+  const NEARC = 520          // recorte de cercanía (evita escalas absurdas)
+
+  const hx = mx + mw / 2     // punto de fuga
+  const hy = my + mh * 0.34  // línea del horizonte dentro del cristal
+  const base = my + mh       // borde inferior = lo más cercano
+
+  /** Proyección única del espejo: posición normalizada + distancia → pantalla. */
+  const proj = (xNorm: number, dist: number) => {
+    const d = Math.max(dist, NEARC)
+    const s = FILL / d
+    /* Curvatura: la carretera que dejamos atrás se desvía con el trazado.
+     * Misma doble integración que la vista principal (`x += dx; dx += curve`),
+     * que para curvatura constante da `offset ≈ curve · n²/2` en unidades de
+     * MUNDO; aquí se normaliza dividiendo por ROAD_W, así vale igual en la
+     * RUTA que en la SUPER. Acotado para que nunca saque la vía del cristal. */
+    const segs = d / SEG
+    const raw = -curveAt(Math.floor((g.pz - d * 0.5) / SEG)) * (segs * segs * 0.5) / ROAD_W
+    const bend = Math.max(-1.1, Math.min(1.1, raw))
+    return {
+      s,
+      x: hx + (xNorm - g.x + bend) * s * (mw / 2),
+      y: hy + (base - hy) * Math.min(1.35, s),
+    }
+  }
+
+  /* ---- carcasa del espejo (bisel exterior) ---- */
   ctx.save()
-  // marco y cristal
   ctx.beginPath()
-  if (ctx.roundRect) ctx.roundRect(mx, my, mw, mh, 8)
-  else ctx.rect(mx, my, mw, mh)
-  ctx.fillStyle = mix(pal.road2, '#0B0D11', 0.45)
+  if (ctx.roundRect) ctx.roundRect(mx - 3, my - 3, mw + 6, mh + 6, r + 2)
+  else ctx.rect(mx - 3, my - 3, mw + 6, mh + 6)
+  ctx.fillStyle = 'rgba(14,16,20,0.82)'
   ctx.fill()
+  ctx.restore()
+
+  /* ---- cristal ---- */
+  ctx.save()
+  ctx.beginPath()
+  if (ctx.roundRect) ctx.roundRect(mx, my, mw, mh, r)
+  else ctx.rect(mx, my, mw, mh)
   ctx.clip()
 
-  // suelo del espejo con perspectiva invertida
-  const grad = ctx.createLinearGradient(0, my, 0, my + mh)
-  grad.addColorStop(0, mix(pal.skyBot, '#1A1E25', 0.5))
-  grad.addColorStop(0.42, mix(pal.road1, '#15181D', 0.3))
-  grad.addColorStop(1, mix(pal.road2, '#0D0F13', 0.2))
-  ctx.fillStyle = grad
-  ctx.fillRect(mx, my, mw, mh)
+  // cielo (lo que se ve sobre el horizonte)
+  const sky = ctx.createLinearGradient(0, my, 0, hy)
+  sky.addColorStop(0, mix(pal.skyTop, '#0E1116', 0.35))
+  sky.addColorStop(1, mix(pal.skyBot, '#141922', 0.3))
+  ctx.fillStyle = sky
+  ctx.fillRect(mx, my, mw, hy - my + 1)
 
-  // líneas de carril fugando hacia el horizonte del espejo
-  const hx = mx + mw / 2, hy = my + mh * 0.38
-  ctx.strokeStyle = `rgba(240,236,226,${0.18 + pal.dark * 0.1})`
-  ctx.lineWidth = 1
-  for (const o of [-0.33, 0.33]) {
+  // terreno a los lados
+  ctx.fillStyle = mix(pal.grass1, '#10131A', 0.45)
+  ctx.fillRect(mx, hy, mw, base - hy)
+
+  /* ---- calzada: trapecio con la MISMA proyección ---- */
+  const nearL = proj(-1, NEARC), nearR = proj(1, NEARC)
+  const farL = proj(-1, FAR), farR = proj(1, FAR)
+  ctx.beginPath()
+  ctx.moveTo(nearL.x, nearL.y)
+  ctx.lineTo(farL.x, farL.y)
+  ctx.lineTo(farR.x, farR.y)
+  ctx.lineTo(nearR.x, nearR.y)
+  ctx.closePath()
+  const road = ctx.createLinearGradient(0, hy, 0, base)
+  road.addColorStop(0, mix(pal.fog, pal.road1, 0.45))     // se funde con la niebla
+  road.addColorStop(0.45, mix(pal.road1, '#111419', 0.25))
+  road.addColorStop(1, mix(pal.road1, '#0C0F14', 0.1))
+  ctx.fillStyle = road
+  ctx.fill()
+
+  /* ---- líneas de carril y bordes ---- */
+  for (let l = 0; l <= LANES; l++) {
+    const o = -1 + (2 * l) / LANES
+    const borde = l === 0 || l === LANES
+    const a = proj(o, NEARC), b = proj(o, FAR)
+    ctx.strokeStyle = borde
+      ? `rgba(244,240,230,${0.34 + pal.dark * 0.12})`
+      : `rgba(244,240,230,${0.14 + pal.dark * 0.07})`
+    ctx.lineWidth = borde ? 1.5 : 0.9
     ctx.beginPath()
-    ctx.moveTo(hx + o * mw * 0.18, hy)
-    ctx.lineTo(hx + o * mw * 1.5, my + mh)
+    ctx.moveTo(a.x, a.y)
+    ctx.lineTo(b.x, b.y)
     ctx.stroke()
   }
 
-  // coches que se acercan por detrás (lejos → cerca)
-  for (const c of g.behind(16000)) {
-    const d = g.z - c.z
-    const s = Math.max(0.05, 1 - d / 16000)
-    const esc = Math.pow(s, 2.1)
-    const cw = Math.max(1.5, esc * mw * 0.3)
-    const cy = hy + esc * mh * 0.72
-    const cx = hx + (c.x - g.x) * mw * 0.42 * (0.25 + esc * 0.9)
-    if (cx < mx - cw || cx > mx + mw + cw) continue
-    drawCar(ctx, cx, cy, cw, CAR_COLORS[c.color], pal.dark, c.truck, false, c.blinker, g.time)
+  /* ---- tráfico: de LEJOS a CERCA (algoritmo del pintor) ---- */
+  const detras = g.behind(FAR)       // ya viene ordenado de lejos a cerca
+  for (const c of detras) {
+    const d = g.pz - c.z
+    const p = proj(c.x, d)
+    // tamaño derivado de la medida REAL del vehículo
+    const wNorm = c.width / ROAD_W
+    const cw = Math.max(2.4, wNorm * p.s * (mw / 2) * 2.1)
+    if (p.x < mx - cw * 1.5 || p.x > mx + mw + cw * 1.5) continue
+    if (p.y < hy - 2) continue
+
+    // los lejanos se difuminan en la niebla
+    ctx.globalAlpha = Math.max(0.25, Math.min(1, 1.25 - d / FAR))
+    const frena = c.speed < c.desired * 0.82
+    drawCar(ctx, p.x, p.y, cw, CAR_COLORS[c.color], pal.dark, c.truck, frena, c.blinker, g.time)
+    if ((c.kind === 'ambulancia' || c.kind === 'patrulla') && cw > 7) {
+      const ch = cw * (c.truck ? 1.3 : 0.8)
+      drawSiren(ctx, p.x, p.y - ch, cw, ch, c.siren, c.kind === 'patrulla')
+    }
+    ctx.globalAlpha = 1
   }
+
+  // reflejo sutil del cristal
+  ctx.fillStyle = 'rgba(255,255,255,0.045)'
+  ctx.fillRect(mx, my, mw, mh * 0.2)
   ctx.restore()
 
-  // marco exterior + aviso de ángulo muerto
+  /* ---- marco + testigos de ángulo muerto ---- */
   ctx.save()
   ctx.beginPath()
-  if (ctx.roundRect) ctx.roundRect(mx, my, mw, mh, 8)
+  if (ctx.roundRect) ctx.roundRect(mx, my, mw, mh, r)
   else ctx.rect(mx, my, mw, mh)
-  ctx.strokeStyle = 'rgba(255,255,255,0.22)'
-  ctx.lineWidth = 1.5
+  ctx.strokeStyle = 'rgba(255,255,255,0.26)'
+  ctx.lineWidth = 1.4
   ctx.stroke()
 
+  /* Testigo de punto ciego: triángulo ámbar en el lado ocupado, como el
+   * indicador del propio retrovisor en un coche moderno. */
   if (g.blindSpot !== 0 && Math.floor(g.time * 3) % 2 === 0) {
-    const bx = g.blindSpot < 0 ? mx + 7 : mx + mw - 21
+    const der = g.blindSpot > 0
+    const bx = der ? mx + mw - 17 : mx + 6
+    const by = my + 6
     ctx.fillStyle = '#FFB224'
     ctx.beginPath()
-    ctx.moveTo(bx + 7, my + 6); ctx.lineTo(bx + 14, my + 18); ctx.lineTo(bx, my + 18)
-    ctx.closePath(); ctx.fill()
+    ctx.moveTo(bx + 5.5, by)
+    ctx.lineTo(bx + 11, by + 10)
+    ctx.lineTo(bx, by + 10)
+    ctx.closePath()
+    ctx.fill()
   }
   ctx.restore()
 }
